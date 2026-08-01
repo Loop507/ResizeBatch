@@ -219,19 +219,19 @@ with st.sidebar:
 
     st.divider()
     st.subheader(":: correzione colore")
-    cc_enabled = st.checkbox("Applica correzione colore", value=False)
+    cc_enabled = st.checkbox("Applica correzione colore", value=False, key="cc_enabled_k")
     cc_awb = cc_auto_levels = False
     cc_cutoff = 1.0
     cc_brightness = cc_contrast = cc_saturation = 1.0
     cc_scurve = 0.0
     if cc_enabled:
-        cc_awb = st.checkbox("Auto White Balance (bilanciamento del bianco)", value=False)
-        cc_auto_levels = st.checkbox("Auto livelli (stretch nero/bianco)", value=False)
+        cc_awb = st.checkbox("Auto White Balance (bilanciamento del bianco)", value=False, key="cc_awb_k")
+        cc_auto_levels = st.checkbox("Auto livelli (stretch nero/bianco)", value=False, key="cc_auto_levels_k")
         if cc_auto_levels:
             cc_cutoff = st.slider("Cutoff auto livelli (%)", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
         cc_brightness = st.slider("Luminosità", min_value=0.5, max_value=1.5, value=1.0, step=0.05)
         cc_contrast = st.slider("Contrasto", min_value=0.5, max_value=1.5, value=1.0, step=0.05)
-        cc_saturation = st.slider("Saturazione", min_value=0.0, max_value=2.0, value=1.0, step=0.05)
+        cc_saturation = st.slider("Saturazione", min_value=0.0, max_value=2.0, value=1.0, step=0.05, key="cc_saturation_k")
         cc_scurve = st.slider("Curva a S (contrasto tonale)", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
 
     settings = Settings(
@@ -257,7 +257,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader(":: regolazioni pro")
-    pro_enabled = st.checkbox("Applica regolazioni pro", value=False)
+    pro_enabled = st.checkbox("Applica regolazioni pro", value=False, key="pro_enabled_k")
     pro_exposure = 0.0
     pro_shadows = pro_highlights = 0.0
     pro_black = 0
@@ -267,9 +267,9 @@ with st.sidebar:
     pro_hsl_range = "Rossi"
     pro_hsl_hue = pro_hsl_sat = pro_hsl_light = 0.0
     if pro_enabled:
-        pro_exposure = st.slider("Esposizione (stop)", min_value=-2.0, max_value=2.0, value=0.0, step=0.1)
-        pro_shadows = st.slider("Ombre", min_value=-100, max_value=100, value=0, step=5)
-        pro_highlights = st.slider("Luci", min_value=-100, max_value=100, value=0, step=5)
+        pro_exposure = st.slider("Esposizione (stop)", min_value=-2.0, max_value=2.0, value=0.0, step=0.1, key="pro_exposure_k")
+        pro_shadows = st.slider("Ombre", min_value=-100, max_value=100, value=0, step=5, key="pro_shadows_k")
+        pro_highlights = st.slider("Luci", min_value=-100, max_value=100, value=0, step=5, key="pro_highlights_k")
         col_bp, col_wp = st.columns(2)
         with col_bp:
             pro_black = st.slider("Punto neri", min_value=0, max_value=50, value=0, step=1)
@@ -278,6 +278,7 @@ with st.sidebar:
         pro_clarity = st.slider(
             "Chiarezza (contrasto locale)", min_value=-100, max_value=100, value=0, step=5,
             help="Positiva: aumenta il 'pop' dei dettagli. Negativa: effetto morbido/dreamy.",
+            key="pro_clarity_k",
         )
 
         st.caption(":: HSL selettivo — regola una singola banda di colore")
@@ -321,17 +322,18 @@ with st.sidebar:
             crop_right = st.slider("Destra", min_value=0, max_value=40, value=0, step=1)
 
     with st.expander("Nitidezza / Rumore"):
-        sharpen_enabled = st.checkbox("Applica nitidezza", value=False)
+        sharpen_enabled = st.checkbox("Applica nitidezza", value=False, key="sharpen_enabled_k")
         sharpen_amount = 0
         if sharpen_enabled:
-            sharpen_amount = st.slider("Quantità nitidezza (%)", min_value=0, max_value=200, value=80, step=10)
+            sharpen_amount = st.slider("Quantità nitidezza (%)", min_value=0, max_value=200, value=80, step=10, key="sharpen_amount_k")
 
-        denoise_enabled = st.checkbox("Applica riduzione rumore", value=False)
+        denoise_enabled = st.checkbox("Applica riduzione rumore", value=False, key="denoise_enabled_k")
         denoise_strength = 0
         if denoise_enabled:
             denoise_strength = st.slider(
                 "Intensità denoise", min_value=0, max_value=100, value=30, step=5,
                 help="Valori alti riducono di più il rumore ma possono ammorbidire i dettagli fini.",
+                key="denoise_strength_k",
             )
 
     with st.expander("Vignettatura"):
@@ -632,6 +634,74 @@ def compute_rgb_histogram(img: Image.Image, bins: int = 64) -> dict:
         counts, _ = np.histogram(arr[:, :, i], bins=bins, range=(0, 255))
         hist[channel] = counts
     return hist
+
+
+# ---------------------------------------------------------------------------
+# Ottimizzazione automatica (analizza una foto e suggerisce le regolazioni)
+# ---------------------------------------------------------------------------
+ANALYSIS_MAX_SIDE = 700  # l'analisi lavora su una copia ridotta, per velocità
+
+
+def analyze_photo(img: Image.Image) -> dict:
+    """Analizza una foto di riferimento e restituisce impostazioni consigliate
+    per correzione colore, regolazioni pro e ritocco tecnico — un'euristica
+    ispirata a come un fotografo valuta rapidamente uno scatto: esposizione,
+    bilanciamento colore, contrasto, saturazione, rumore/nitidezza."""
+    small = flatten_to_rgb(img).copy()
+    small.thumbnail((ANALYSIS_MAX_SIDE, ANALYSIS_MAX_SIDE), Image.LANCZOS)
+    arr = np.asarray(small).astype(np.float32)
+
+    lum = arr.mean(axis=2)
+    mean_lum = float(lum.mean())
+    p2, p98 = np.percentile(lum, [2, 98])
+    contrast_std = float(lum.std())
+
+    means = arr.reshape(-1, 3).mean(axis=0)
+    color_cast = float(means.max() - means.min())
+
+    hsv = np.asarray(small.convert("HSV")).astype(np.float32)
+    mean_sat = float(hsv[:, :, 1].mean())
+
+    gray = cv2.cvtColor(np.asarray(small), cv2.COLOR_RGB2GRAY)
+    laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    result = {
+        "mean_lum": mean_lum, "contrast_std": contrast_std,
+        "color_cast": color_cast, "mean_sat": mean_sat, "laplacian_var": laplacian_var,
+    }
+
+    # --- esposizione: riporta la luminanza media verso ~128 ---
+    target_lum = 128.0
+    if mean_lum < 95:
+        result["exposure"] = round(min(1.2, (target_lum - mean_lum) / 90), 2)
+    elif mean_lum > 165:
+        result["exposure"] = round(max(-1.2, (target_lum - mean_lum) / 90), 2)
+    else:
+        result["exposure"] = 0.0
+
+    # --- white balance: dominante di colore evidente tra i canali medi ---
+    result["awb"] = bool(color_cast > 15)
+
+    # --- auto livelli: se il range dinamico (2°-98° percentile) è compresso ---
+    result["auto_levels"] = bool((p98 - p2) < 180)
+
+    # --- ombre/luci in base ai percentili estremi ---
+    result["shadows"] = 30 if p2 > 40 else 0
+    result["highlights"] = -30 if p98 < 215 else 0
+
+    # --- chiarezza: se il contrasto locale è basso, dai un po' di 'pop' ---
+    result["clarity"] = 25 if contrast_std < 40 else 0
+
+    # --- saturazione: se la foto appare smorta, alzala leggermente ---
+    result["saturation"] = 1.15 if mean_sat < 70 else 1.0
+
+    # --- denoise/nitidezza in base all'energia dei bordi (varianza Laplaciana) ---
+    # euristica empirica: molto rumore/texture fine -> varianza alta e "sporca";
+    # immagine morbida/sfocata -> varianza bassa
+    result["denoise_strength"] = 25 if laplacian_var > 800 else 0
+    result["sharpen_amount"] = 60 if laplacian_var < 150 else 0
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1057,6 +1127,71 @@ def build_output_name(original_name: str, rename_base: str, custom_name: str, in
     else:
         base = f"{rename_base}_{index}"
     return f"{sanitize_filename(base)}_{tw}x{th}.{ext}"
+
+
+# ---------------------------------------------------------------------------
+# Ottimizzazione automatica
+# ---------------------------------------------------------------------------
+if uploaded_files:
+    st.divider()
+    st.subheader(":: ottimizzazione automatica")
+    st.caption(
+        "Analizza la prima foto caricata (esposizione, colore, contrasto, rumore) e propone "
+        "regolazioni per tutto il batch — un punto di partenza automatico, sempre modificabile "
+        "a mano dopo negli slider della sidebar."
+    )
+    col_auto1, col_auto2 = st.columns([1, 1])
+    with col_auto1:
+        auto_clicked = st.button("✨ Analizza e ottimizza automaticamente", type="primary")
+    with col_auto2:
+        reset_clicked = st.button("↺ Ripristina impostazioni manuali")
+
+    if auto_clicked:
+        ref_for_analysis = Image.open(uploaded_files[0])
+        analysis = analyze_photo(ref_for_analysis)
+
+        st.session_state["cc_enabled_k"] = True
+        st.session_state["cc_awb_k"] = analysis["awb"]
+        st.session_state["cc_auto_levels_k"] = analysis["auto_levels"]
+        st.session_state["cc_saturation_k"] = analysis["saturation"]
+
+        st.session_state["pro_enabled_k"] = True
+        st.session_state["pro_exposure_k"] = analysis["exposure"]
+        st.session_state["pro_shadows_k"] = analysis["shadows"]
+        st.session_state["pro_highlights_k"] = analysis["highlights"]
+        st.session_state["pro_clarity_k"] = analysis["clarity"]
+
+        st.session_state["denoise_enabled_k"] = analysis["denoise_strength"] > 0
+        st.session_state["denoise_strength_k"] = analysis["denoise_strength"]
+        st.session_state["sharpen_enabled_k"] = analysis["sharpen_amount"] > 0
+        st.session_state["sharpen_amount_k"] = analysis["sharpen_amount"]
+
+        st.session_state["auto_optimize_report"] = analysis
+        st.rerun()
+
+    if reset_clicked:
+        for k in [
+            "cc_enabled_k", "cc_awb_k", "cc_auto_levels_k", "cc_saturation_k",
+            "pro_enabled_k", "pro_exposure_k", "pro_shadows_k", "pro_highlights_k", "pro_clarity_k",
+            "denoise_enabled_k", "denoise_strength_k", "sharpen_enabled_k", "sharpen_amount_k",
+        ]:
+            st.session_state.pop(k, None)
+        st.session_state.pop("auto_optimize_report", None)
+        st.rerun()
+
+    if "auto_optimize_report" in st.session_state:
+        a = st.session_state.auto_optimize_report
+        with st.expander("✨ Cosa ha rilevato l'analisi automatica", expanded=False):
+            notes = []
+            notes.append(f"Luminosità media: {a['mean_lum']:.0f}/255 → esposizione consigliata {a['exposure']:+.2f} stop")
+            notes.append(f"Dominante colore rilevata: {a['color_cast']:.0f} → White Balance {'attivato' if a['awb'] else 'non necessario'}")
+            notes.append(f"Range dinamico → Auto livelli {'attivati' if a['auto_levels'] else 'non necessari'}")
+            notes.append(f"Contrasto locale: {a['contrast_std']:.0f} → Chiarezza {'+' + str(a['clarity']) if a['clarity'] else 'invariata'}")
+            notes.append(f"Saturazione media: {a['mean_sat']:.0f}/255 → {'leggero boost' if a['saturation'] > 1 else 'invariata'}")
+            notes.append(f"Nitidezza/rumore rilevati → denoise {a['denoise_strength']}%, nitidezza {a['sharpen_amount']}%")
+            for n in notes:
+                st.write(f"- {n}")
+            st.caption("Le impostazioni sono già state applicate agli slider della sidebar — puoi affinarle liberamente.")
 
 
 # ---------------------------------------------------------------------------
