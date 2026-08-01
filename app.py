@@ -145,6 +145,13 @@ class TitleSettings:
     margin: int
 
 
+def sanitize_filename(name: str) -> str:
+    """Rimuove caratteri non validi nei nomi file (separatori di percorso,
+    virgolette, ecc.) per evitare problemi nello ZIP o sul filesystem."""
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
+    return cleaned or "foto"
+
+
 # ---------------------------------------------------------------------------
 # Sidebar :: parametri resize
 # ---------------------------------------------------------------------------
@@ -189,6 +196,13 @@ with st.sidebar:
         placeholder="es. lavoro",
         help="Con 'lavoro' otterrai lavoro_1, lavoro_2, lavoro_3... "
              "Puoi usare {n} per posizionare il numero manualmente, es. 'foto_{n}_finale'.",
+    )
+    zip_name_default = sanitize_filename(rename_base) if rename_base else "resizebatch"
+    zip_name = st.text_input(
+        "Nome file ZIP (senza estensione)",
+        value=zip_name_default,
+        placeholder="es. lavoro_cliente_finale",
+        help="Il nome dello ZIP scaricabile. Di default riprende il 'Nome base' qui sopra.",
     )
 
     st.divider()
@@ -902,13 +916,6 @@ def image_to_bytes(img: Image.Image, fmt: str, quality: int) -> bytes:
     return buf.getvalue()
 
 
-def sanitize_filename(name: str) -> str:
-    """Rimuove caratteri non validi nei nomi file (separatori di percorso,
-    virgolette, ecc.) per evitare problemi nello ZIP o sul filesystem."""
-    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
-    return cleaned or "foto"
-
-
 def build_output_name(original_name: str, rename_base: str, custom_name: str, index: int, tw: int, th: int, ext: str) -> str:
     """Genera il nome del file di output, in ordine di priorità:
     1. nome personalizzato (dalla tabella di rinomina individuale)
@@ -1023,7 +1030,7 @@ if uploaded_files:
             st.download_button(
                 "⬇ scarica tutte (ZIP)",
                 data=st.session_state.zip_bytes,
-                file_name=f"resizebatch_{settings.target_w}x{settings.target_h}.zip",
+                file_name=f"{sanitize_filename(zip_name)}_{settings.target_w}x{settings.target_h}.zip",
                 mime="application/zip",
                 type="primary",
             )
