@@ -896,8 +896,23 @@ def add_title_text(img: Image.Image, ts: TitleSettings) -> Image.Image:
     return composited.convert("RGB")
 
 
+def flatten_to_rgb(img: Image.Image) -> Image.Image:
+    """Converte in RGB gestendo correttamente la trasparenza: le immagini
+    con canale alpha (RGBA/LA, o P con trasparenza) vengono composte su
+    uno sfondo bianco invece di un semplice convert('RGB'), che altrimenti
+    lascia spesso valori RGB azzerati (neri) nelle zone trasparenti."""
+    if img.mode == "P" and "transparency" in img.info:
+        img = img.convert("RGBA")
+    if img.mode in ("RGBA", "LA"):
+        background = Image.new("RGB", img.size, (255, 255, 255))
+        alpha = img.convert("RGBA").split()[-1]
+        background.paste(img.convert("RGB"), mask=alpha)
+        return background
+    return img.convert("RGB")
+
+
 def process_image(img: Image.Image, s: Settings, cs: ColorSettings, ps: ProSettings, rs: RetouchSettings, ts: TitleSettings, seed: int) -> Image.Image:
-    img = img.convert("RGB")
+    img = flatten_to_rgb(img)
     img = apply_color_correction(img, cs)
     img = apply_pro_adjustments(img, ps)
     img = apply_retouch(img, rs)
@@ -914,6 +929,36 @@ def image_to_bytes(img: Image.Image, fmt: str, quality: int) -> bytes:
     else:
         img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+PREVIEW_THUMB_MAX = 480
+
+
+def make_preview_thumbnail(img: Image.Image) -> Image.Image:
+    """Crea una miniatura leggera per la sola visualizzazione in anteprima.
+    Evita di tenere in memoria le immagini a piena risoluzione (originale +
+    elaborata) per l'intero batch — solo i byte già codificati (out_bytes,
+    usati per download/ZIP) mantengono la qualità piena."""
+    thumb = img.copy()
+    thumb.thumbnail((PREVIEW_THUMB_MAX, PREVIEW_THUMB_MAX), Image.LANCZOS)
+    return thumb
+
+
+def dedupe_filename(name: str, used_names: set) -> str:
+    """Se il nome è già stato usato in questo batch, aggiunge un suffisso
+    numerico (_2, _3...) per evitare collisioni nello ZIP e crash dei
+    pulsanti di download (Streamlit richiede chiavi univoche)."""
+    if name not in used_names:
+        used_names.add(name)
+        return name
+    base, ext = name.rsplit(".", 1) if "." in name else (name, "")
+    counter = 2
+    while True:
+        candidate = f"{base}_{counter}.{ext}" if ext else f"{base}_{counter}"
+        if candidate not in used_names:
+            used_names.add(candidate)
+            return candidate
+        counter += 1
 
 
 def build_output_name(original_name: str, rename_base: str, custom_name: str, index: int, tw: int, th: int, ext: str) -> str:
@@ -981,19 +1026,32 @@ if uploaded_files:
         st.session_state.processed = []
         progress = st.progress(0.0)
         ext = "jpg" if settings.output_format == "JPEG" else "png"
+        used_names = set()
 
         for i, uf in enumerate(uploaded_files):
             img = Image.open(uf)
             out_img = process_image(img, settings, color_settings, pro_settings, retouch_settings, title_settings, seed=i)
             out_bytes = image_to_bytes(out_img, settings.output_format, settings.jpeg_quality)
             custom_name = custom_names.get(uf.name, "")
-            out_name = build_output_name(uf.name, settings.rename_base, custom_name, i + 1, settings.target_w, settings.target_h, ext)
-            st.session_state.processed.append((out_name, out_bytes, img, out_img))
+            raw_name = build_output_name(uf.name, settings.rename_base, custom_name, i + 1, settings.target_w, settings.target_h, ext)
+            out_name = dedupe_filename(raw_name, used_names)
+
+            # miniature leggere per l'anteprima: l'output a piena qualità resta
+            # comunque disponibile in out_bytes per il download singolo/ZIP.
+            # Le dimensioni vere si salvano a parte: la miniatura NON le rappresenta.
+            orig_size = img.size
+            out_size = out_img.size
+            orig_thumb = make_preview_thumbnail(img)
+            out_thumb = make_preview_thumbnail(out_img)
+            st.session_state.processed.append((out_name, out_bytes, orig_thumb, out_thumb, orig_size, out_size))
             progress.progress((i + 1) / len(uploaded_files))
 
+        # JPEG è già compresso: ZIP_STORED evita di sprecare CPU ricomprimendo
+        # dati incomprimibili. Per PNG, ZIP_DEFLATED può ancora aiutare un po'.
+        zip_compression = zipfile.ZIP_STORED if settings.output_format == "JPEG" else zipfile.ZIP_DEFLATED
         zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for name, data, _, _ in st.session_state.processed:
+        with zipfile.ZipFile(zip_buf, "w", zip_compression) as zf:
+            for name, data, _, _, _, _ in st.session_state.processed:
                 zf.writestr(name, data)
         st.session_state.zip_bytes = zip_buf.getvalue()
 
@@ -1003,12 +1061,12 @@ if uploaded_files:
         shown = min(preview_limit, total)
         st.subheader(f":: anteprima / preview ({shown} di {total})")
 
-        for name, data, orig_img, out_img in st.session_state.processed[:preview_limit]:
+        for i, (name, data, orig_img, out_img, orig_size, out_size) in enumerate(st.session_state.processed[:preview_limit]):
             c1, c2, c3 = st.columns([1, 1, 1])
             with c1:
-                st.image(orig_img, caption=f"originale {orig_img.size[0]}x{orig_img.size[1]}", use_container_width=True)
+                st.image(orig_img, caption=f"originale {orig_size[0]}x{orig_size[1]}", use_container_width=True)
             with c2:
-                st.image(out_img, caption=f"output {out_img.size[0]}x{out_img.size[1]}", use_container_width=True)
+                st.image(out_img, caption=f"output {out_size[0]}x{out_size[1]}", use_container_width=True)
             with c3:
                 st.write(name)
                 st.download_button(
@@ -1016,7 +1074,7 @@ if uploaded_files:
                     data=data,
                     file_name=name,
                     mime=f"image/{'jpeg' if settings.output_format == 'JPEG' else 'png'}",
-                    key=f"dl_{name}",
+                    key=f"dl_{i}_{name}",
                 )
             st.divider()
 
