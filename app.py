@@ -55,8 +55,20 @@ st.caption(
 # ---------------------------------------------------------------------------
 # Session state init
 # ---------------------------------------------------------------------------
+# PROCESSED_SCHEMA_VERSION va incrementata ogni volta che cambia la forma
+# delle tuple salvate in st.session_state.processed (es. numero di campi).
+# Senza questo controllo, un redeploy con una struttura dati diversa può far
+# crashare l'app con un ValueError/unpacking error se la sessione del
+# browser conservava ancora risultati elaborati con la vecchia struttura.
+PROCESSED_SCHEMA_VERSION = 2  # (nome, bytes, thumb_orig, thumb_out, dim_orig, dim_out)
+
+if st.session_state.get("processed_schema_version") != PROCESSED_SCHEMA_VERSION:
+    st.session_state.processed = []
+    st.session_state.zip_bytes = None
+    st.session_state.processed_schema_version = PROCESSED_SCHEMA_VERSION
+
 if "processed" not in st.session_state:
-    st.session_state.processed = []  # list of (filename, bytes, orig_img, out_img)
+    st.session_state.processed = []  # list of (filename, bytes, orig_thumb, out_thumb, orig_size, out_size)
 if "zip_bytes" not in st.session_state:
     st.session_state.zip_bytes = None
 
@@ -734,6 +746,22 @@ def apply_retouch(img: Image.Image, rs: RetouchSettings) -> Image.Image:
     return out
 
 
+def apply_retouch_pair(img: Image.Image, alpha, rs: RetouchSettings) -> tuple:
+    """Come apply_retouch, ma applica anche a una maschera alpha (se
+    presente) le stesse trasformazioni geometriche (raddrizza, crop) — il
+    denoise invece resta solo sull'RGB, la trasparenza non va 'denoisata'."""
+    out = apply_straighten(img, rs.straighten_angle)
+    out = apply_manual_crop(out, rs.crop_top, rs.crop_bottom, rs.crop_left, rs.crop_right)
+    if rs.denoise_enabled:
+        out = apply_denoise(out, rs.denoise_strength)
+
+    if alpha is None:
+        return out, None
+    out_alpha = apply_straighten(alpha, rs.straighten_angle)
+    out_alpha = apply_manual_crop(out_alpha, rs.crop_top, rs.crop_bottom, rs.crop_left, rs.crop_right)
+    return out, out_alpha
+
+
 def apply_retouch_post_resize(img: Image.Image, rs: RetouchSettings) -> Image.Image:
     """Nitidezza e vignettatura si applicano dopo il resize: la nitidezza
     per essere calibrata sulla risoluzione finale, la vignetta per
@@ -753,11 +781,10 @@ def resize_stretch(img: Image.Image, tw: int, th: int) -> Image.Image:
     return img.resize((tw, th), Image.LANCZOS)
 
 
-def resize_crop(img: Image.Image, tw: int, th: int) -> Image.Image:
-    src_w, src_h = img.size
-    target_ratio = tw / th
+def _crop_box_for_ratio(src_w: int, src_h: int, target_ratio: float) -> tuple:
+    """Calcola il box di center-crop (x0, y0, w, h) per portare un'immagine
+    src_w x src_h al rapporto target_ratio, senza deformarla."""
     src_ratio = src_w / src_h
-
     if src_ratio > target_ratio:
         new_w = int(src_h * target_ratio)
         new_h = src_h
@@ -768,8 +795,12 @@ def resize_crop(img: Image.Image, tw: int, th: int) -> Image.Image:
         new_h = int(src_w / target_ratio)
         x0 = 0
         y0 = (src_h - new_h) // 2
+    return x0, y0, new_w, new_h
 
-    cropped = img.crop((x0, y0, x0 + new_w, y0 + new_h))
+
+def resize_crop(img: Image.Image, tw: int, th: int) -> Image.Image:
+    x0, y0, cw, ch = _crop_box_for_ratio(*img.size, tw / th)
+    cropped = img.crop((x0, y0, x0 + cw, y0 + ch))
     return cropped.resize((tw, th), Image.LANCZOS)
 
 
@@ -829,6 +860,35 @@ def resize_only(img: Image.Image, s: Settings, seed: int) -> Image.Image:
         raise ValueError(f"Modalità sconosciuta: {s.mode}")
 
 
+def resize_pair(img: Image.Image, alpha, s: Settings, seed: int) -> tuple:
+    """Applica il resize sia all'immagine RGB sia (se presente) alla maschera
+    alpha, con la STESSA geometria — fondamentale per tenere la trasparenza
+    allineata pixel per pixel dopo crop/pad. Nelle modalità pad/pad_glitch,
+    le aree aggiunte (letterbox) diventano opache (alpha=255): sono nuovo
+    contenuto scelto dall'utente (colore o pattern), non 'buchi' del PNG
+    originale."""
+    tw, th = s.target_w, s.target_h
+    if alpha is None:
+        return resize_only(img, s, seed), None
+
+    if s.mode == "stretch":
+        out_img = resize_stretch(img, tw, th)
+        out_alpha = alpha.resize((tw, th), Image.LANCZOS)
+    elif s.mode == "crop":
+        x0, y0, cw, ch = _crop_box_for_ratio(*img.size, tw / th)
+        out_img = img.crop((x0, y0, x0 + cw, y0 + ch)).resize((tw, th), Image.LANCZOS)
+        out_alpha = alpha.crop((x0, y0, x0 + cw, y0 + ch)).resize((tw, th), Image.LANCZOS)
+    elif s.mode in ("pad", "pad_glitch"):
+        out_img = resize_pad(img, tw, th, s.pad_color) if s.mode == "pad" else resize_pad_glitch(img, tw, th, seed)
+        scaled_alpha, off_x, off_y = _fit_inside(alpha, tw, th)
+        canvas_alpha = Image.new("L", (tw, th), 255)
+        canvas_alpha.paste(scaled_alpha, (off_x, off_y))
+        out_alpha = canvas_alpha
+    else:
+        raise ValueError(f"Modalità sconosciuta: {s.mode}")
+    return out_img, out_alpha
+
+
 def load_font(style: str, size: int) -> ImageFont.FreeTypeFont:
     """Carica il font bundlato in fonts/. Se il file manca (es. repo GitHub
     senza la cartella fonts/), ricade sul font di default di Pillow."""
@@ -863,11 +923,13 @@ def _anchor_xy(position: str, canvas_w: int, canvas_h: int, text_w: int, text_h:
     return x, y
 
 
-def add_title_text(img: Image.Image, ts: TitleSettings) -> Image.Image:
+def add_title_text(img: Image.Image, ts: TitleSettings, keep_alpha: bool = False) -> Image.Image:
     """Disegna un titolo testuale sull'immagine, con posizione a 9 ancoraggi,
-    colore/opacità regolabili e sfondo opzionale semi-trasparente."""
+    colore/opacità regolabili e sfondo opzionale semi-trasparente. Se
+    keep_alpha=True ritorna RGBA (usato quando si preserva la trasparenza
+    di un PNG); altrimenti appiattisce su RGB come prima."""
     if not ts.enabled or not ts.text.strip():
-        return img
+        return img if keep_alpha else img.convert("RGB")
 
     base = img.convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -893,7 +955,7 @@ def add_title_text(img: Image.Image, ts: TitleSettings) -> Image.Image:
     draw.text((x - bbox[0], y - bbox[1]), ts.text, font=font, fill=(*ts.color, text_alpha))
 
     composited = Image.alpha_composite(base, overlay)
-    return composited.convert("RGB")
+    return composited if keep_alpha else composited.convert("RGB")
 
 
 def flatten_to_rgb(img: Image.Image) -> Image.Image:
@@ -911,15 +973,32 @@ def flatten_to_rgb(img: Image.Image) -> Image.Image:
     return img.convert("RGB")
 
 
+def has_transparency(img: Image.Image) -> bool:
+    """Vero se l'immagine ha un canale alpha effettivo (RGBA/LA, o P con
+    trasparenza indicizzata)."""
+    return img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+
+
 def process_image(img: Image.Image, s: Settings, cs: ColorSettings, ps: ProSettings, rs: RetouchSettings, ts: TitleSettings, seed: int) -> Image.Image:
-    img = flatten_to_rgb(img)
-    img = apply_color_correction(img, cs)
-    img = apply_pro_adjustments(img, ps)
-    img = apply_retouch(img, rs)
-    img = resize_only(img, s, seed)
-    img = apply_retouch_post_resize(img, rs)
-    img = add_title_text(img, ts)
-    return img
+    """Pipeline completa. Se il formato di output è PNG e la foto originale
+    ha trasparenza, l'alpha viene preservato end-to-end (raddrizza/crop/
+    resize applicati identicamente alla maschera; le aree di padding
+    diventano opache). Regolazioni colore/pro/nitidezza/vignetta lavorano
+    solo sull'RGB: la trasparenza non va né corretta né 'denoisata'."""
+    preserve_alpha = s.output_format == "PNG" and has_transparency(img)
+    alpha = img.convert("RGBA").split()[-1] if preserve_alpha else None
+
+    rgb = flatten_to_rgb(img)
+    rgb = apply_color_correction(rgb, cs)
+    rgb = apply_pro_adjustments(rgb, ps)
+    rgb, alpha = apply_retouch_pair(rgb, alpha, rs)
+    rgb, alpha = resize_pair(rgb, alpha, s, seed)
+    rgb = apply_retouch_post_resize(rgb, rs)
+
+    if preserve_alpha and alpha is not None:
+        rgba_out = Image.merge("RGBA", (*rgb.split(), alpha))
+        return add_title_text(rgba_out, ts, keep_alpha=True)
+    return add_title_text(rgb, ts, keep_alpha=False)
 
 
 def image_to_bytes(img: Image.Image, fmt: str, quality: int) -> bytes:
