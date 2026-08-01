@@ -350,18 +350,41 @@ def build_output_name(original_name: str, rename_base: str, index: int, tw: int,
 
 
 # ---------------------------------------------------------------------------
+# Anteprima live (solo prima foto, si aggiorna ad ogni modifica parametri)
+# ---------------------------------------------------------------------------
+if uploaded_files:
+    st.divider()
+    st.subheader(":: anteprima live / live preview")
+    st.caption(
+        "Si aggiorna in tempo reale sulla prima foto caricata mentre muovi gli slider "
+        "nella sidebar. Il batch completo viene elaborato solo quando premi 'Elabora tutte'."
+    )
+
+    ref_file = uploaded_files[0]
+    ref_img = Image.open(ref_file)
+    live_out = process_image(ref_img, settings, color_settings, seed=0)
+
+    lc1, lc2 = st.columns(2)
+    with lc1:
+        st.image(ref_img, caption=f"originale — {ref_img.size[0]}x{ref_img.size[1]} — {ref_file.name}", use_container_width=True)
+    with lc2:
+        st.image(live_out, caption=f"anteprima — {live_out.size[0]}x{live_out.size[1]}", use_container_width=True)
+
+# ---------------------------------------------------------------------------
 # Elaborazione
 # ---------------------------------------------------------------------------
 if uploaded_files:
+    total_weight_mb = sum(uf.size for uf in uploaded_files) / (1024 * 1024)
     st.write(
-        f":: {len(uploaded_files)} file caricati — target {settings.target_w}x{settings.target_h} "
-        f"— modalità: {mode_labels[settings.mode]}"
+        f":: {len(uploaded_files)} file caricati (~{total_weight_mb:.1f} MB totali) — "
+        f"target {settings.target_w}x{settings.target_h} — modalità: {mode_labels[settings.mode]}"
     )
-    if len(uploaded_files) > 60:
+    if total_weight_mb > 300:
         st.warning(
-            "Con più di 60 foto rischi di saturare la RAM limitata del piano gratuito "
-            "di Streamlit Cloud (~1GB). Se l'app va in errore 'resource limits', prova a "
-            "elaborare il batch in gruppi più piccoli."
+            f"Il batch pesa ~{total_weight_mb:.0f} MB. Il piano gratuito di Streamlit Cloud ha "
+            "circa 1GB di RAM condivisa tra upload e immagini elaborate in memoria: sopra i "
+            "300-400MB totali rischi l'errore 'resource limits'. Se succede, prova a dividere "
+            "il batch in gruppi più piccoli — non conta il numero di foto in sé, ma il loro peso."
         )
 
     if st.button("▶ Elabora tutte", type="primary"):
