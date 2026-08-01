@@ -22,11 +22,15 @@ Dipendenze: streamlit, pillow, numpy
 """
 
 import io
+import math
 import os
+import re
 import zipfile
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
+import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
@@ -108,6 +112,22 @@ HSL_RANGES = {
     "Viola": 270,
     "Magenta": 315,
 }
+
+
+@dataclass
+class RetouchSettings:
+    straighten_angle: float    # -45..45 gradi
+    crop_top: int              # % 0..40
+    crop_bottom: int
+    crop_left: int
+    crop_right: int
+    denoise_enabled: bool
+    denoise_strength: int      # 0..100
+    sharpen_enabled: bool
+    sharpen_amount: int        # 0..200 (percent unsharp mask)
+    vignette_enabled: bool
+    vignette_amount: int       # 0..100
+    vignette_feather: int      # 0..100
 
 
 @dataclass
@@ -258,6 +278,63 @@ with st.sidebar:
     )
 
     st.divider()
+    st.subheader(":: ritocco tecnico")
+
+    with st.expander("Raddrizza / Crop"):
+        straighten_angle = st.slider("Raddrizza (°)", min_value=-45.0, max_value=45.0, value=0.0, step=0.5)
+        st.caption("Taglio manuale dai bordi (%)")
+        col_ct, col_cb = st.columns(2)
+        with col_ct:
+            crop_top = st.slider("Alto", min_value=0, max_value=40, value=0, step=1)
+        with col_cb:
+            crop_bottom = st.slider("Basso", min_value=0, max_value=40, value=0, step=1)
+        col_cl, col_cr = st.columns(2)
+        with col_cl:
+            crop_left = st.slider("Sinistra", min_value=0, max_value=40, value=0, step=1)
+        with col_cr:
+            crop_right = st.slider("Destra", min_value=0, max_value=40, value=0, step=1)
+
+    with st.expander("Nitidezza / Rumore"):
+        sharpen_enabled = st.checkbox("Applica nitidezza", value=False)
+        sharpen_amount = 0
+        if sharpen_enabled:
+            sharpen_amount = st.slider("Quantità nitidezza (%)", min_value=0, max_value=200, value=80, step=10)
+
+        denoise_enabled = st.checkbox("Applica riduzione rumore", value=False)
+        denoise_strength = 0
+        if denoise_enabled:
+            denoise_strength = st.slider(
+                "Intensità denoise", min_value=0, max_value=100, value=30, step=5,
+                help="Valori alti riducono di più il rumore ma possono ammorbidire i dettagli fini.",
+            )
+
+    with st.expander("Vignettatura"):
+        vignette_enabled = st.checkbox("Applica vignettatura", value=False)
+        vignette_amount = 0
+        vignette_feather = 50
+        if vignette_enabled:
+            vignette_amount = st.slider("Intensità vignetta", min_value=0, max_value=100, value=40, step=5)
+            vignette_feather = st.slider(
+                "Morbidezza bordo", min_value=0, max_value=100, value=50, step=5,
+                help="Bassa = vignetta che parte più vicino al centro (più marcata). Alta = falloff più graduale.",
+            )
+
+    retouch_settings = RetouchSettings(
+        straighten_angle=straighten_angle,
+        crop_top=crop_top,
+        crop_bottom=crop_bottom,
+        crop_left=crop_left,
+        crop_right=crop_right,
+        denoise_enabled=denoise_enabled,
+        denoise_strength=denoise_strength,
+        sharpen_enabled=sharpen_enabled,
+        sharpen_amount=sharpen_amount,
+        vignette_enabled=vignette_enabled,
+        vignette_amount=vignette_amount,
+        vignette_feather=vignette_feather,
+    )
+
+    st.divider()
     st.subheader(":: titolo / testo")
     title_enabled = st.checkbox("Aggiungi titolo a tutte le foto", value=False)
     title_text = ""
@@ -329,6 +406,29 @@ uploaded_files = st.file_uploader(
     type=["jpg", "jpeg", "png", "webp"],
     accept_multiple_files=True,
 )
+
+custom_names = {}
+if uploaded_files:
+    with st.expander(":: rinomina individuale (avanzata)"):
+        st.caption(
+            "Sovrascrive il 'Nome base' della sidebar file per file. Lascia vuoto per usare "
+            "il nome automatico. Utile per dare nomi diversi a foto diverse dello stesso batch "
+            "(es. 'foto_x', 'foto_y')."
+        )
+        rename_df = pd.DataFrame({
+            "file originale": [uf.name for uf in uploaded_files],
+            "nome personalizzato": ["" for _ in uploaded_files],
+        })
+        edited_df = st.data_editor(
+            rename_df,
+            key="rename_table",
+            hide_index=True,
+            use_container_width=True,
+            disabled=["file originale"],
+        )
+        for _, row in edited_df.iterrows():
+            if row["nome personalizzato"].strip():
+                custom_names[row["file originale"]] = row["nome personalizzato"].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +609,130 @@ def compute_rgb_histogram(img: Image.Image, bins: int = 64) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Ritocco tecnico (raddrizza/crop, denoise, nitidezza, vignettatura)
+# ---------------------------------------------------------------------------
+def _rotated_rect_max_area(w: float, h: float, angle_rad: float) -> tuple:
+    """Calcola le dimensioni del più grande rettangolo assiale che sta
+    interamente dentro un rettangolo WxH ruotato di angle_rad, senza
+    includere gli angoli vuoti/neri generati dalla rotazione."""
+    if w <= 0 or h <= 0:
+        return 0, 0
+    width_is_longer = w >= h
+    side_long, side_short = (w, h) if width_is_longer else (h, w)
+
+    sin_a = abs(math.sin(angle_rad))
+    cos_a = abs(math.cos(angle_rad))
+
+    if side_short <= 2.0 * sin_a * cos_a * side_long or abs(sin_a - cos_a) < 1e-10:
+        x = 0.5 * side_short
+        if width_is_longer:
+            wr, hr = x / sin_a, x / cos_a
+        else:
+            wr, hr = x / cos_a, x / sin_a
+    else:
+        cos_2a = cos_a * cos_a - sin_a * sin_a
+        wr = (w * cos_a - h * sin_a) / cos_2a
+        hr = (h * cos_a - w * sin_a) / cos_2a
+
+    return wr, hr
+
+
+def apply_straighten(img: Image.Image, angle_deg: float) -> Image.Image:
+    """Ruota l'immagine per raddrizzarla e ritaglia automaticamente il
+    rettangolo più grande possibile senza bordi neri agli angoli."""
+    if angle_deg == 0:
+        return img
+    w, h = img.size
+    rotated = img.rotate(-angle_deg, resample=Image.BICUBIC, expand=True)
+    wr, hr = _rotated_rect_max_area(w, h, math.radians(angle_deg))
+    rw, rh = rotated.size
+    wr, hr = min(wr, rw), min(hr, rh)
+    x0 = (rw - wr) / 2.0
+    y0 = (rh - hr) / 2.0
+    return rotated.crop((x0, y0, x0 + wr, y0 + hr))
+
+
+def apply_manual_crop(img: Image.Image, top: int, bottom: int, left: int, right: int) -> Image.Image:
+    """Ritaglia percentuali fisse dai 4 bordi (0-40% ciascuno)."""
+    if top == 0 and bottom == 0 and left == 0 and right == 0:
+        return img
+    w, h = img.size
+    x0 = int(w * left / 100.0)
+    x1 = w - int(w * right / 100.0)
+    y0 = int(h * top / 100.0)
+    y1 = h - int(h * bottom / 100.0)
+    x1 = max(x1, x0 + 1)
+    y1 = max(y1, y0 + 1)
+    return img.crop((x0, y0, x1, y1))
+
+
+def apply_denoise(img: Image.Image, strength: int) -> Image.Image:
+    """Riduzione del rumore con bilateral filter (OpenCV): leviga il
+    rumore preservando i bordi netti molto meglio di un blur uniforme."""
+    if strength <= 0:
+        return img
+    arr = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+    d = 5 + int(strength / 10)              # diametro del vicinato, cresce con l'intensità
+    sigma = 10 + strength * 1.5             # sigma colore/spazio
+    denoised = cv2.bilateralFilter(arr, d=d, sigmaColor=sigma, sigmaSpace=sigma)
+    return Image.fromarray(cv2.cvtColor(denoised, cv2.COLOR_BGR2RGB), mode="RGB")
+
+
+def apply_sharpen(img: Image.Image, amount: int) -> Image.Image:
+    """Nitidezza via unsharp mask: amount è la percentuale (0-200%) di
+    contrasto aggiunto ai bordi rilevati."""
+    if amount <= 0:
+        return img
+    return img.filter(ImageFilter.UnsharpMask(radius=2, percent=int(amount), threshold=3))
+
+
+def apply_vignette(img: Image.Image, amount: int, feather: int) -> Image.Image:
+    """Scurisce gradualmente i bordi dell'immagine verso gli angoli,
+    con un raggio di partenza (feather) regolabile per un falloff più
+    o meno morbido."""
+    if amount <= 0:
+        return img
+    w, h = img.size
+    arr = np.asarray(img).astype(np.float32)
+
+    y_idx, x_idx = np.ogrid[:h, :w]
+    cx, cy = w / 2.0, h / 2.0
+    max_dist = math.sqrt(cx ** 2 + cy ** 2)
+    dist = np.sqrt((x_idx - cx) ** 2 + (y_idx - cy) ** 2) / max_dist  # 0 centro -> 1 angolo
+
+    start = 1.0 - (feather / 100.0) * 0.9
+    falloff = np.clip((dist - start) / max(1.0 - start, 1e-6), 0.0, 1.0)
+    falloff = falloff * falloff * (3 - 2 * falloff)  # smoothstep
+
+    darken = 1.0 - (amount / 100.0) * falloff
+    arr = arr * darken[:, :, None]
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="RGB")
+
+
+def apply_retouch(img: Image.Image, rs: RetouchSettings) -> Image.Image:
+    """Ordine: raddrizza -> crop manuale -> denoise (prima del resize, a
+    piena risoluzione, dove funziona meglio). Nitidezza e vignettatura
+    vengono applicate altrove nella pipeline (dopo il resize)."""
+    out = apply_straighten(img, rs.straighten_angle)
+    out = apply_manual_crop(out, rs.crop_top, rs.crop_bottom, rs.crop_left, rs.crop_right)
+    if rs.denoise_enabled:
+        out = apply_denoise(out, rs.denoise_strength)
+    return out
+
+
+def apply_retouch_post_resize(img: Image.Image, rs: RetouchSettings) -> Image.Image:
+    """Nitidezza e vignettatura si applicano dopo il resize: la nitidezza
+    per essere calibrata sulla risoluzione finale, la vignetta per
+    seguire correttamente la geometria del frame di output."""
+    out = img
+    if rs.sharpen_enabled:
+        out = apply_sharpen(out, rs.sharpen_amount)
+    if rs.vignette_enabled:
+        out = apply_vignette(out, rs.vignette_amount, rs.vignette_feather)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Funzioni di trasformazione (resize)
 # ---------------------------------------------------------------------------
 def resize_stretch(img: Image.Image, tw: int, th: int) -> Image.Image:
@@ -658,11 +882,13 @@ def add_title_text(img: Image.Image, ts: TitleSettings) -> Image.Image:
     return composited.convert("RGB")
 
 
-def process_image(img: Image.Image, s: Settings, cs: ColorSettings, ps: ProSettings, ts: TitleSettings, seed: int) -> Image.Image:
+def process_image(img: Image.Image, s: Settings, cs: ColorSettings, ps: ProSettings, rs: RetouchSettings, ts: TitleSettings, seed: int) -> Image.Image:
     img = img.convert("RGB")
     img = apply_color_correction(img, cs)
     img = apply_pro_adjustments(img, ps)
+    img = apply_retouch(img, rs)
     img = resize_only(img, s, seed)
+    img = apply_retouch_post_resize(img, rs)
     img = add_title_text(img, ts)
     return img
 
@@ -676,18 +902,30 @@ def image_to_bytes(img: Image.Image, fmt: str, quality: int) -> bytes:
     return buf.getvalue()
 
 
-def build_output_name(original_name: str, rename_base: str, index: int, tw: int, th: int, ext: str) -> str:
-    """Genera il nome del file di output. Se rename_base è vuoto, mantiene
-    il nome originale con suffisso dimensione. Altrimenti applica il
-    pattern di rinomina (supporta {n} come placeholder esplicito)."""
+def sanitize_filename(name: str) -> str:
+    """Rimuove caratteri non validi nei nomi file (separatori di percorso,
+    virgolette, ecc.) per evitare problemi nello ZIP o sul filesystem."""
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
+    return cleaned or "foto"
+
+
+def build_output_name(original_name: str, rename_base: str, custom_name: str, index: int, tw: int, th: int, ext: str) -> str:
+    """Genera il nome del file di output, in ordine di priorità:
+    1. nome personalizzato (dalla tabella di rinomina individuale)
+    2. pattern 'nome base' della sidebar (con {n} come placeholder esplicito)
+    3. nome originale con suffisso dimensione, se nessuno dei due è impostato
+    """
+    if custom_name and custom_name.strip():
+        base = sanitize_filename(custom_name.strip())
+        return f"{base}_{tw}x{th}.{ext}"
     if not rename_base:
-        base = original_name.rsplit(".", 1)[0]
+        base = sanitize_filename(original_name.rsplit(".", 1)[0])
         return f"{base}_{tw}x{th}.{ext}"
     if "{n}" in rename_base:
         base = rename_base.replace("{n}", str(index))
     else:
         base = f"{rename_base}_{index}"
-    return f"{base}_{tw}x{th}.{ext}"
+    return f"{sanitize_filename(base)}_{tw}x{th}.{ext}"
 
 
 # ---------------------------------------------------------------------------
@@ -703,7 +941,7 @@ if uploaded_files:
 
     ref_file = uploaded_files[0]
     ref_img = Image.open(ref_file)
-    live_out = process_image(ref_img, settings, color_settings, pro_settings, title_settings, seed=0)
+    live_out = process_image(ref_img, settings, color_settings, pro_settings, retouch_settings, title_settings, seed=0)
 
     lc1, lc2 = st.columns(2)
     with lc1:
@@ -739,9 +977,10 @@ if uploaded_files:
 
         for i, uf in enumerate(uploaded_files):
             img = Image.open(uf)
-            out_img = process_image(img, settings, color_settings, pro_settings, title_settings, seed=i)
+            out_img = process_image(img, settings, color_settings, pro_settings, retouch_settings, title_settings, seed=i)
             out_bytes = image_to_bytes(out_img, settings.output_format, settings.jpeg_quality)
-            out_name = build_output_name(uf.name, settings.rename_base, i + 1, settings.target_w, settings.target_h, ext)
+            custom_name = custom_names.get(uf.name, "")
+            out_name = build_output_name(uf.name, settings.rename_base, custom_name, i + 1, settings.target_w, settings.target_h, ext)
             st.session_state.processed.append((out_name, out_bytes, img, out_img))
             progress.progress((i + 1) / len(uploaded_files))
 
