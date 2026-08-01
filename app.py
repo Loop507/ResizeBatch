@@ -22,12 +22,19 @@ Dipendenze: streamlit, pillow, numpy
 """
 
 import io
+import os
 import zipfile
 from dataclasses import dataclass
 
 import numpy as np
 import streamlit as st
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
+
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+FONT_PATHS = {
+    "Regular": os.path.join(FONT_DIR, "IBMPlexMono-Regular.ttf"),
+    "Bold": os.path.join(FONT_DIR, "IBMPlexMono-Bold.ttf"),
+}
 
 # ---------------------------------------------------------------------------
 # Config pagina
@@ -71,6 +78,21 @@ class ColorSettings:
     contrast: float
     saturation: float
     s_curve_strength: float
+
+
+@dataclass
+class TitleSettings:
+    enabled: bool
+    text: str
+    position: str  # es. "bottom-center"
+    font_style: str  # "Regular" o "Bold"
+    font_size: int
+    color: tuple
+    opacity: float  # 0-1
+    bg_enabled: bool
+    bg_color: tuple
+    bg_opacity: float  # 0-1
+    margin: int
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +177,56 @@ with st.sidebar:
         contrast=cc_contrast,
         saturation=cc_saturation,
         s_curve_strength=cc_scurve,
+    )
+
+    st.divider()
+    st.subheader(":: titolo / testo")
+    title_enabled = st.checkbox("Aggiungi titolo a tutte le foto", value=False)
+    title_text = ""
+    title_position = "bottom-center"
+    title_font_style = "Bold"
+    title_font_size = 48
+    title_color = (255, 255, 255)
+    title_opacity = 1.0
+    title_bg_enabled = False
+    title_bg_color = (0, 0, 0)
+    title_bg_opacity = 0.5
+    title_margin = 40
+    if title_enabled:
+        title_text = st.text_input("Testo del titolo", value="LOOP507")
+        position_labels = {
+            "top-left": "alto sinistra", "top-center": "alto centro", "top-right": "alto destra",
+            "center-left": "centro sinistra", "center": "centro", "center-right": "centro destra",
+            "bottom-left": "basso sinistra", "bottom-center": "basso centro", "bottom-right": "basso destra",
+        }
+        title_position = st.selectbox(
+            "Posizione", options=list(position_labels.keys()),
+            format_func=lambda k: position_labels[k], index=7,
+        )
+        title_font_style = st.radio("Stile font", options=["Regular", "Bold"], index=1, horizontal=True)
+        title_font_size = st.slider("Dimensione (px)", min_value=12, max_value=300, value=48, step=2)
+        title_color_hex = st.color_picker("Colore testo", value="#FFFFFF")
+        title_color = tuple(int(title_color_hex.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+        title_opacity = st.slider("Opacità testo (%)", min_value=10, max_value=100, value=100, step=5) / 100
+        title_margin = st.slider("Margine dai bordi (px)", min_value=0, max_value=200, value=40, step=5)
+        title_bg_enabled = st.checkbox("Sfondo dietro al testo", value=False)
+        if title_bg_enabled:
+            title_bg_color_hex = st.color_picker("Colore sfondo", value="#000000")
+            title_bg_color = tuple(int(title_bg_color_hex.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+            title_bg_opacity = st.slider("Opacità sfondo (%)", min_value=10, max_value=100, value=50, step=5) / 100
+
+    title_settings = TitleSettings(
+        enabled=title_enabled,
+        text=title_text,
+        position=title_position,
+        font_style=title_font_style,
+        font_size=title_font_size,
+        color=title_color,
+        opacity=title_opacity,
+        bg_enabled=title_bg_enabled,
+        bg_color=title_bg_color,
+        bg_opacity=title_bg_opacity,
+        margin=title_margin,
     )
 
     st.divider()
@@ -320,10 +392,79 @@ def resize_only(img: Image.Image, s: Settings, seed: int) -> Image.Image:
         raise ValueError(f"Modalità sconosciuta: {s.mode}")
 
 
-def process_image(img: Image.Image, s: Settings, cs: ColorSettings, seed: int) -> Image.Image:
+def load_font(style: str, size: int) -> ImageFont.FreeTypeFont:
+    """Carica il font bundlato in fonts/. Se il file manca (es. repo GitHub
+    senza la cartella fonts/), ricade sul font di default di Pillow."""
+    path = FONT_PATHS.get(style, FONT_PATHS["Bold"])
+    try:
+        return ImageFont.truetype(path, size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _anchor_xy(position: str, canvas_w: int, canvas_h: int, text_w: int, text_h: int, margin: int) -> tuple:
+    """Calcola la posizione (x, y) del testo in base a uno dei 9 ancoraggi."""
+    if position == "center":
+        v, h = "center", "center"
+    else:
+        v, h = position.split("-")
+
+    if h == "left":
+        x = margin
+    elif h == "right":
+        x = canvas_w - text_w - margin
+    else:  # center
+        x = (canvas_w - text_w) // 2
+
+    if v == "top":
+        y = margin
+    elif v == "bottom":
+        y = canvas_h - text_h - margin
+    else:  # center
+        y = (canvas_h - text_h) // 2
+
+    return x, y
+
+
+def add_title_text(img: Image.Image, ts: TitleSettings) -> Image.Image:
+    """Disegna un titolo testuale sull'immagine, con posizione a 9 ancoraggi,
+    colore/opacità regolabili e sfondo opzionale semi-trasparente."""
+    if not ts.enabled or not ts.text.strip():
+        return img
+
+    base = img.convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    font = load_font(ts.font_style, ts.font_size)
+    bbox = draw.textbbox((0, 0), ts.text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+
+    x, y = _anchor_xy(ts.position, base.width, base.height, text_w, text_h, ts.margin)
+
+    if ts.bg_enabled:
+        pad = max(6, ts.font_size // 6)
+        bg_alpha = int(255 * ts.bg_opacity)
+        draw.rectangle(
+            [x - pad, y - pad, x + text_w + pad, y + text_h + pad],
+            fill=(*ts.bg_color, bg_alpha),
+        )
+
+    text_alpha = int(255 * ts.opacity)
+    # offset verticale: textbbox include un top-offset (bbox[1]) da compensare
+    draw.text((x - bbox[0], y - bbox[1]), ts.text, font=font, fill=(*ts.color, text_alpha))
+
+    composited = Image.alpha_composite(base, overlay)
+    return composited.convert("RGB")
+
+
+def process_image(img: Image.Image, s: Settings, cs: ColorSettings, ts: TitleSettings, seed: int) -> Image.Image:
     img = img.convert("RGB")
     img = apply_color_correction(img, cs)
-    return resize_only(img, s, seed)
+    img = resize_only(img, s, seed)
+    img = add_title_text(img, ts)
+    return img
 
 
 def image_to_bytes(img: Image.Image, fmt: str, quality: int) -> bytes:
@@ -362,7 +503,7 @@ if uploaded_files:
 
     ref_file = uploaded_files[0]
     ref_img = Image.open(ref_file)
-    live_out = process_image(ref_img, settings, color_settings, seed=0)
+    live_out = process_image(ref_img, settings, color_settings, title_settings, seed=0)
 
     lc1, lc2 = st.columns(2)
     with lc1:
@@ -394,7 +535,7 @@ if uploaded_files:
 
         for i, uf in enumerate(uploaded_files):
             img = Image.open(uf)
-            out_img = process_image(img, settings, color_settings, seed=i)
+            out_img = process_image(img, settings, color_settings, title_settings, seed=i)
             out_bytes = image_to_bytes(out_img, settings.output_format, settings.jpeg_quality)
             out_name = build_output_name(uf.name, settings.rename_base, i + 1, settings.target_w, settings.target_h, ext)
             st.session_state.processed.append((out_name, out_bytes, img, out_img))
