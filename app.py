@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import streamlit as st
-from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 FONT_PATHS = {
@@ -78,6 +78,36 @@ class ColorSettings:
     contrast: float
     saturation: float
     s_curve_strength: float
+
+
+@dataclass
+class ProSettings:
+    enabled: bool
+    exposure: float          # stop, -2..+2
+    shadows: float           # -100..100
+    highlights: float        # -100..100
+    black_point: int         # 0..50
+    white_point: int         # 205..255
+    clarity: float           # -100..100
+    hsl_enabled: bool
+    hsl_range: str            # una delle chiavi di HSL_RANGES
+    hsl_hue_shift: float      # -30..30 gradi
+    hsl_sat_shift: float      # -100..100
+    hsl_light_shift: float    # -100..100
+
+
+# centro tonalità (in gradi, 0-360) per ciascuna banda colore selezionabile
+# nell'HSL selettivo — stesse bande concettuali di Lightroom/Capture One
+HSL_RANGES = {
+    "Rossi": 0,
+    "Arancioni": 30,
+    "Gialli": 60,
+    "Verdi": 120,
+    "Ciano": 180,
+    "Blu": 240,
+    "Viola": 270,
+    "Magenta": 315,
+}
 
 
 @dataclass
@@ -177,6 +207,54 @@ with st.sidebar:
         contrast=cc_contrast,
         saturation=cc_saturation,
         s_curve_strength=cc_scurve,
+    )
+
+    st.divider()
+    st.subheader(":: regolazioni pro")
+    pro_enabled = st.checkbox("Applica regolazioni pro", value=False)
+    pro_exposure = 0.0
+    pro_shadows = pro_highlights = 0.0
+    pro_black = 0
+    pro_white = 255
+    pro_clarity = 0.0
+    pro_hsl_enabled = False
+    pro_hsl_range = "Rossi"
+    pro_hsl_hue = pro_hsl_sat = pro_hsl_light = 0.0
+    if pro_enabled:
+        pro_exposure = st.slider("Esposizione (stop)", min_value=-2.0, max_value=2.0, value=0.0, step=0.1)
+        pro_shadows = st.slider("Ombre", min_value=-100, max_value=100, value=0, step=5)
+        pro_highlights = st.slider("Luci", min_value=-100, max_value=100, value=0, step=5)
+        col_bp, col_wp = st.columns(2)
+        with col_bp:
+            pro_black = st.slider("Punto neri", min_value=0, max_value=50, value=0, step=1)
+        with col_wp:
+            pro_white = st.slider("Punto bianchi", min_value=205, max_value=255, value=255, step=1)
+        pro_clarity = st.slider(
+            "Chiarezza (contrasto locale)", min_value=-100, max_value=100, value=0, step=5,
+            help="Positiva: aumenta il 'pop' dei dettagli. Negativa: effetto morbido/dreamy.",
+        )
+
+        st.caption(":: HSL selettivo — regola una singola banda di colore")
+        pro_hsl_enabled = st.checkbox("Applica HSL selettivo", value=False)
+        if pro_hsl_enabled:
+            pro_hsl_range = st.selectbox("Banda colore", options=list(HSL_RANGES.keys()), index=0)
+            pro_hsl_hue = st.slider("Tonalità (°)", min_value=-30, max_value=30, value=0, step=1)
+            pro_hsl_sat = st.slider("Saturazione", min_value=-100, max_value=100, value=0, step=5)
+            pro_hsl_light = st.slider("Luminosità", min_value=-100, max_value=100, value=0, step=5)
+
+    pro_settings = ProSettings(
+        enabled=pro_enabled,
+        exposure=pro_exposure,
+        shadows=pro_shadows,
+        highlights=pro_highlights,
+        black_point=pro_black,
+        white_point=pro_white,
+        clarity=pro_clarity,
+        hsl_enabled=pro_hsl_enabled,
+        hsl_range=pro_hsl_range,
+        hsl_hue_shift=pro_hsl_hue,
+        hsl_sat_shift=pro_hsl_sat,
+        hsl_light_shift=pro_hsl_light,
     )
 
     st.divider()
@@ -307,6 +385,127 @@ def apply_color_correction(img: Image.Image, cs: ColorSettings) -> Image.Image:
     if cs.s_curve_strength > 0:
         out = apply_s_curve(out, cs.s_curve_strength)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Regolazioni pro (esposizione, ombre/luci, punti nero/bianco, chiarezza, HSL)
+# ---------------------------------------------------------------------------
+def apply_exposure(img: Image.Image, stops: float) -> Image.Image:
+    """Esposizione in stop fotografici: ogni stop raddoppia/dimezza la
+    luce, coerente con la convenzione fotografica (non una semplice
+    somma lineare come 'luminosità')."""
+    if stops == 0:
+        return img
+    arr = np.asarray(img).astype(np.float32) * (2.0 ** stops)
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="RGB")
+
+
+def apply_shadows_highlights(img: Image.Image, shadows: float, highlights: float) -> Image.Image:
+    """Solleva/abbassa selettivamente le ombre e le luci in base alla
+    luminanza del pixel, lasciando i mezzitoni relativamente intatti —
+    stesso principio dei cursori Ombre/Luci di Lightroom."""
+    if shadows == 0 and highlights == 0:
+        return img
+    arr = np.asarray(img).astype(np.float32)
+    lum = arr.mean(axis=2)  # luminanza approssimata
+
+    shadow_weight = np.clip(1.0 - lum / 128.0, 0.0, 1.0)       # forte su pixel scuri
+    highlight_weight = np.clip((lum - 128.0) / 127.0, 0.0, 1.0)  # forte su pixel chiari
+
+    delta = (shadows / 100.0) * 80.0 * shadow_weight + (highlights / 100.0) * 80.0 * highlight_weight
+    arr = arr + delta[:, :, None]
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="RGB")
+
+
+def apply_black_white_point(img: Image.Image, black: int, white: int) -> Image.Image:
+    """Stira i livelli: il punto nero diventa 0, il punto bianco diventa
+    255, tutto il resto viene rimappato proporzionalmente (levels)."""
+    if black <= 0 and white >= 255:
+        return img
+    white = max(white, black + 1)  # evita divisione per zero
+    arr = np.asarray(img).astype(np.float32)
+    arr = (arr - black) / (white - black) * 255.0
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="RGB")
+
+
+def apply_clarity(img: Image.Image, amount: float) -> Image.Image:
+    """Contrasto locale: sottrae una versione molto sfocata dell'immagine
+    da se stessa per isolare i dettagli a media frequenza, poi li
+    riaggiunge amplificati. Valori negativi ammorbidiscono (effetto
+    'dreamy')."""
+    if amount == 0:
+        return img
+    arr = np.asarray(img).astype(np.float32)
+    blurred = np.asarray(img.filter(ImageFilter.GaussianBlur(radius=25))).astype(np.float32)
+    detail = arr - blurred
+    arr = arr + detail * (amount / 100.0)
+    return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="RGB")
+
+
+def _hue_distance(h: np.ndarray, center_deg: float) -> np.ndarray:
+    """Distanza angolare circolare tra ogni hue (0-255, scala PIL) e un
+    centro dato in gradi (0-360). Ritorna gradi 0-180."""
+    h_deg = h.astype(np.float32) * (360.0 / 255.0)
+    diff = np.abs(h_deg - center_deg) % 360.0
+    return np.minimum(diff, 360.0 - diff)
+
+
+def apply_hsl_selective(img: Image.Image, color_range: str, hue_shift: float, sat_shift: float, light_shift: float) -> Image.Image:
+    """Regola tonalità/saturazione/luminosità solo per i pixel la cui
+    tonalità ricade in una banda di colore (es. 'solo i rossi'), con una
+    dissolvenza morbida ai bordi della banda per evitare transizioni dure."""
+    if hue_shift == 0 and sat_shift == 0 and light_shift == 0:
+        return img
+
+    center = HSL_RANGES.get(color_range, 0)
+    hsv = np.asarray(img.convert("HSV")).astype(np.float32)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+    dist = _hue_distance(h, center)
+    band_half_width = 35.0  # gradi di banda con falloff morbido
+    mask = np.clip(1.0 - dist / band_half_width, 0.0, 1.0)
+    mask = mask * mask * (3 - 2 * mask)  # smoothstep
+
+    if hue_shift != 0:
+        h_deg = h * (360.0 / 255.0)
+        h_deg = (h_deg + hue_shift * mask) % 360.0
+        h = h_deg * (255.0 / 360.0)
+    if sat_shift != 0:
+        s = s * (1.0 + (sat_shift / 100.0) * mask)
+    if light_shift != 0:
+        v = v * (1.0 + (light_shift / 100.0) * mask)
+
+    hsv_out = np.stack([
+        np.clip(h, 0, 255),
+        np.clip(s, 0, 255),
+        np.clip(v, 0, 255),
+    ], axis=2).astype(np.uint8)
+    return Image.fromarray(hsv_out, mode="HSV").convert("RGB")
+
+
+def apply_pro_adjustments(img: Image.Image, ps: ProSettings) -> Image.Image:
+    if not ps.enabled:
+        return img
+    out = img
+    out = apply_exposure(out, ps.exposure)
+    out = apply_shadows_highlights(out, ps.shadows, ps.highlights)
+    out = apply_black_white_point(out, ps.black_point, ps.white_point)
+    out = apply_clarity(out, ps.clarity)
+    if ps.hsl_enabled:
+        out = apply_hsl_selective(out, ps.hsl_range, ps.hsl_hue_shift, ps.hsl_sat_shift, ps.hsl_light_shift)
+    return out
+
+
+def compute_rgb_histogram(img: Image.Image, bins: int = 64) -> dict:
+    """Istogramma RGB a risoluzione ridotta (default 64 bin) pronto per
+    essere passato a st.line_chart — mostra la distribuzione tonale
+    dell'immagine corrente in tempo reale."""
+    arr = np.asarray(img.convert("RGB"))
+    hist = {}
+    for i, channel in enumerate(["R", "G", "B"]):
+        counts, _ = np.histogram(arr[:, :, i], bins=bins, range=(0, 255))
+        hist[channel] = counts
+    return hist
 
 
 # ---------------------------------------------------------------------------
@@ -459,9 +658,10 @@ def add_title_text(img: Image.Image, ts: TitleSettings) -> Image.Image:
     return composited.convert("RGB")
 
 
-def process_image(img: Image.Image, s: Settings, cs: ColorSettings, ts: TitleSettings, seed: int) -> Image.Image:
+def process_image(img: Image.Image, s: Settings, cs: ColorSettings, ps: ProSettings, ts: TitleSettings, seed: int) -> Image.Image:
     img = img.convert("RGB")
     img = apply_color_correction(img, cs)
+    img = apply_pro_adjustments(img, ps)
     img = resize_only(img, s, seed)
     img = add_title_text(img, ts)
     return img
@@ -503,13 +703,17 @@ if uploaded_files:
 
     ref_file = uploaded_files[0]
     ref_img = Image.open(ref_file)
-    live_out = process_image(ref_img, settings, color_settings, title_settings, seed=0)
+    live_out = process_image(ref_img, settings, color_settings, pro_settings, title_settings, seed=0)
 
     lc1, lc2 = st.columns(2)
     with lc1:
         st.image(ref_img, caption=f"originale — {ref_img.size[0]}x{ref_img.size[1]} — {ref_file.name}", use_container_width=True)
     with lc2:
         st.image(live_out, caption=f"anteprima — {live_out.size[0]}x{live_out.size[1]}", use_container_width=True)
+
+    with st.expander(":: istogramma / histogram"):
+        hist_data = compute_rgb_histogram(live_out)
+        st.line_chart(hist_data, color=["#FF4B4B", "#3DD56D", "#3D9DF3"])
 
 # ---------------------------------------------------------------------------
 # Elaborazione
@@ -535,7 +739,7 @@ if uploaded_files:
 
         for i, uf in enumerate(uploaded_files):
             img = Image.open(uf)
-            out_img = process_image(img, settings, color_settings, title_settings, seed=i)
+            out_img = process_image(img, settings, color_settings, pro_settings, title_settings, seed=i)
             out_bytes = image_to_bytes(out_img, settings.output_format, settings.jpeg_quality)
             out_name = build_output_name(uf.name, settings.rename_base, i + 1, settings.target_w, settings.target_h, ext)
             st.session_state.processed.append((out_name, out_bytes, img, out_img))
