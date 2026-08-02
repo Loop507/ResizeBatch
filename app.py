@@ -251,6 +251,8 @@ with st.sidebar:
              "a mano dopo, negli slider qui sotto.",
     )
     if st.button("Applica preset selezionato") and preset_choice != "(nessuno)":
+        for k in ALL_PRESET_KEYS:  # azzera prima, per un risultato deterministico
+            st.session_state.pop(k, None)
         for k, v in BUILTIN_PRESETS[preset_choice].items():
             st.session_state[k] = v
         st.rerun()
@@ -262,6 +264,8 @@ with st.sidebar:
                 try:
                     loaded = json.loads(uploaded_preset_file.read())
                     applied = 0
+                    for k in ALL_PRESET_KEYS:  # azzera prima, per un risultato deterministico
+                        st.session_state.pop(k, None)
                     for k, v in loaded.items():
                         if k in ALL_PRESET_KEYS:
                             st.session_state[k] = v
@@ -1370,11 +1374,7 @@ if uploaded_files:
         st.rerun()
 
     if reset_clicked:
-        for k in [
-            "cc_enabled_k", "cc_awb_k", "cc_auto_levels_k", "cc_saturation_k",
-            "pro_enabled_k", "pro_exposure_k", "pro_shadows_k", "pro_highlights_k", "pro_clarity_k",
-            "denoise_enabled_k", "denoise_strength_k", "sharpen_enabled_k", "sharpen_amount_k",
-        ]:
+        for k in ALL_PRESET_KEYS:
             st.session_state.pop(k, None)
         st.session_state.pop("auto_optimize_report", None)
         st.rerun()
