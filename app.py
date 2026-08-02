@@ -111,6 +111,11 @@ class ProSettings:
     hsl_hue_shift: float      # -30..30 gradi
     hsl_sat_shift: float      # -100..100
     hsl_light_shift: float    # -100..100
+    split_tone_enabled: bool = False
+    shadow_color: tuple = (0, 0, 0)      # colore tinta ombre (RGB)
+    shadow_amount: int = 0               # 0..100
+    highlight_color: tuple = (255, 255, 255)  # colore tinta luci (RGB)
+    highlight_amount: int = 0            # 0..100
 
 
 # centro tonalità (in gradi, 0-360) per ciascuna banda colore selezionabile
@@ -135,6 +140,8 @@ ALL_PRESET_KEYS = {
     "pro_enabled_k", "pro_exposure_k", "pro_shadows_k", "pro_highlights_k",
     "pro_black_k", "pro_white_k", "pro_clarity_k",
     "pro_hsl_enabled_k", "pro_hsl_range_k", "pro_hsl_hue_k", "pro_hsl_sat_k", "pro_hsl_light_k",
+    "split_tone_enabled_k", "split_shadow_color_k", "split_shadow_amount_k",
+    "split_highlight_color_k", "split_highlight_amount_k",
     "denoise_enabled_k", "denoise_strength_k", "sharpen_enabled_k", "sharpen_amount_k",
     "vignette_enabled_k", "vignette_amount_k", "vignette_feather_k",
 }
@@ -157,12 +164,15 @@ BUILTIN_PRESETS = {
     "Teal & Orange Cinematic": {
         "cc_enabled_k": True, "cc_saturation_k": 1.05, "cc_contrast_k": 1.15,
         "pro_enabled_k": True, "pro_exposure_k": -0.1, "pro_clarity_k": 15,
-        "pro_hsl_enabled_k": True, "pro_hsl_range_k": "Ciano", "pro_hsl_hue_k": 0, "pro_hsl_sat_k": 50, "pro_hsl_light_k": 0,
+        "split_tone_enabled_k": True, "split_shadow_color_k": "#1B4F72", "split_shadow_amount_k": 40,
+        "split_highlight_color_k": "#E8934A", "split_highlight_amount_k": 35,
         "vignette_enabled_k": True, "vignette_amount_k": 25, "vignette_feather_k": 50,
     },
     "Moody Film": {
         "cc_enabled_k": True, "cc_saturation_k": 0.85, "cc_contrast_k": 1.05,
         "pro_enabled_k": True, "pro_shadows_k": 20, "pro_highlights_k": -25, "pro_black_k": 10, "pro_clarity_k": -10,
+        "split_tone_enabled_k": True, "split_shadow_color_k": "#4A3728", "split_shadow_amount_k": 25,
+        "split_highlight_color_k": "#D9C7A3", "split_highlight_amount_k": 15,
     },
     "Kodak Portra Warm": {
         "cc_enabled_k": True, "cc_saturation_k": 1.1, "cc_brightness_k": 1.05,
@@ -366,6 +376,13 @@ with st.sidebar:
     pro_hsl_enabled = False
     pro_hsl_range = "Rossi"
     pro_hsl_hue = pro_hsl_sat = pro_hsl_light = 0.0
+    split_tone_enabled = False
+    shadow_hex = "#1B4F72"
+    highlight_hex = "#E67E22"
+    split_shadow_color = (0, 0, 0)
+    split_shadow_amount = 0
+    split_highlight_color = (255, 255, 255)
+    split_highlight_amount = 0
     if pro_enabled:
         pro_exposure = st.slider("Esposizione (stop)", min_value=-2.0, max_value=2.0, value=0.0, step=0.1, key="pro_exposure_k")
         pro_shadows = st.slider("Ombre", min_value=-100, max_value=100, value=0, step=5, key="pro_shadows_k")
@@ -389,6 +406,21 @@ with st.sidebar:
             pro_hsl_sat = st.slider("Saturazione", min_value=-100, max_value=100, value=0, step=5, key="pro_hsl_sat_k")
             pro_hsl_light = st.slider("Luminosità", min_value=-100, max_value=100, value=0, step=5, key="pro_hsl_light_k")
 
+        st.caption(":: color grading (split toning) — tinge ombre e luci separatamente")
+        split_tone_enabled = st.checkbox("Applica color grading", value=False, key="split_tone_enabled_k")
+        if split_tone_enabled:
+            col_sh, col_hi = st.columns(2)
+            with col_sh:
+                st.caption("Ombre")
+                shadow_hex = st.color_picker("Colore ombre", value="#1B4F72", key="split_shadow_color_k")
+                split_shadow_color = tuple(int(shadow_hex.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+                split_shadow_amount = st.slider("Intensità ombre", min_value=0, max_value=100, value=30, step=5, key="split_shadow_amount_k")
+            with col_hi:
+                st.caption("Luci")
+                highlight_hex = st.color_picker("Colore luci", value="#E67E22", key="split_highlight_color_k")
+                split_highlight_color = tuple(int(highlight_hex.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
+                split_highlight_amount = st.slider("Intensità luci", min_value=0, max_value=100, value=30, step=5, key="split_highlight_amount_k")
+
     pro_settings = ProSettings(
         enabled=pro_enabled,
         exposure=pro_exposure,
@@ -402,6 +434,11 @@ with st.sidebar:
         hsl_hue_shift=pro_hsl_hue,
         hsl_sat_shift=pro_hsl_sat,
         hsl_light_shift=pro_hsl_light,
+        split_tone_enabled=split_tone_enabled,
+        shadow_color=split_shadow_color,
+        shadow_amount=split_shadow_amount,
+        highlight_color=split_highlight_color,
+        highlight_amount=split_highlight_amount,
     )
 
     st.divider()
@@ -538,6 +575,9 @@ with st.sidebar:
             "pro_black_k": pro_black, "pro_white_k": pro_white, "pro_clarity_k": pro_clarity,
             "pro_hsl_enabled_k": pro_hsl_enabled, "pro_hsl_range_k": pro_hsl_range,
             "pro_hsl_hue_k": pro_hsl_hue, "pro_hsl_sat_k": pro_hsl_sat, "pro_hsl_light_k": pro_hsl_light,
+            "split_tone_enabled_k": split_tone_enabled, "split_shadow_color_k": shadow_hex,
+            "split_shadow_amount_k": split_shadow_amount, "split_highlight_color_k": highlight_hex,
+            "split_highlight_amount_k": split_highlight_amount,
             "denoise_enabled_k": denoise_enabled, "denoise_strength_k": denoise_strength,
             "sharpen_enabled_k": sharpen_enabled, "sharpen_amount_k": sharpen_amount,
             "vignette_enabled_k": vignette_enabled, "vignette_amount_k": vignette_amount,
@@ -736,6 +776,37 @@ def apply_hsl_selective(img: Image.Image, color_range: str, hue_shift: float, sa
     return Image.fromarray(hsv_out, mode="HSV").convert("RGB")
 
 
+def apply_split_toning(img: Image.Image, shadow_color: tuple, shadow_amount: int, highlight_color: tuple, highlight_amount: int) -> Image.Image:
+    """Color grading a due bande (split toning): tinge le ombre con un
+    colore e le luci con un altro, sfumando in base alla luminanza di ogni
+    pixel — lo stesso principio usato per il vero look 'teal & orange'
+    cinematico, dove ombre e luci ricevono una grana di colore indipendente
+    (diverso dall'HSL selettivo, che seleziona per tonalità, non per
+    luminanza)."""
+    if shadow_amount <= 0 and highlight_amount <= 0:
+        return img
+
+    arr = np.asarray(img).astype(np.float32)
+    lum = arr.mean(axis=2)
+    shadow_weight = np.clip(1.0 - lum / 128.0, 0.0, 1.0)
+    highlight_weight = np.clip((lum - 128.0) / 127.0, 0.0, 1.0)
+
+    MAX_BLEND = 0.5  # tetto di miscelazione: mantiene un effetto di 'tinta', non un colore piatto
+    out = arr.copy()
+
+    if shadow_amount > 0:
+        shadow_arr = np.array(shadow_color, dtype=np.float32)
+        w = (shadow_weight * (shadow_amount / 100.0) * MAX_BLEND)[:, :, None]
+        out = out + w * (shadow_arr - out)
+
+    if highlight_amount > 0:
+        highlight_arr = np.array(highlight_color, dtype=np.float32)
+        w = (highlight_weight * (highlight_amount / 100.0) * MAX_BLEND)[:, :, None]
+        out = out + w * (highlight_arr - out)
+
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="RGB")
+
+
 def apply_pro_adjustments(img: Image.Image, ps: ProSettings) -> Image.Image:
     if not ps.enabled:
         return img
@@ -746,6 +817,8 @@ def apply_pro_adjustments(img: Image.Image, ps: ProSettings) -> Image.Image:
     out = apply_clarity(out, ps.clarity)
     if ps.hsl_enabled:
         out = apply_hsl_selective(out, ps.hsl_range, ps.hsl_hue_shift, ps.hsl_sat_shift, ps.hsl_light_shift)
+    if ps.split_tone_enabled:
+        out = apply_split_toning(out, ps.shadow_color, ps.shadow_amount, ps.highlight_color, ps.highlight_amount)
     return out
 
 
