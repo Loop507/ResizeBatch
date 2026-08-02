@@ -22,6 +22,7 @@ Dipendenze: streamlit, pillow, numpy
 """
 
 import io
+import json
 import math
 import os
 import re
@@ -125,6 +126,70 @@ HSL_RANGES = {
     "Magenta": 315,
 }
 
+# Whitelist delle chiavi controllabili da un preset (built-in o caricato da JSON).
+# Usata anche per validare i file .json caricati dall'utente, evitando di scrivere
+# in session_state chiavi arbitrarie non previste.
+ALL_PRESET_KEYS = {
+    "cc_enabled_k", "cc_awb_k", "cc_auto_levels_k", "cc_brightness_k", "cc_contrast_k",
+    "cc_saturation_k", "cc_scurve_k",
+    "pro_enabled_k", "pro_exposure_k", "pro_shadows_k", "pro_highlights_k",
+    "pro_black_k", "pro_white_k", "pro_clarity_k",
+    "pro_hsl_enabled_k", "pro_hsl_range_k", "pro_hsl_hue_k", "pro_hsl_sat_k", "pro_hsl_light_k",
+    "denoise_enabled_k", "denoise_strength_k", "sharpen_enabled_k", "sharpen_amount_k",
+    "vignette_enabled_k", "vignette_amount_k", "vignette_feather_k",
+}
+
+# Preset di stile predefiniti. Calibrati prendendo spunto da trend di color grading
+# reali (teal & orange cinematico, moody film con ombre calde, simulazioni pellicola
+# stile Kodak Portra, pastello/matte da social) più un preset firmato Loop507.
+BUILTIN_PRESETS = {
+    "Pop Art": {
+        "cc_enabled_k": True, "cc_saturation_k": 1.6, "cc_contrast_k": 1.2, "cc_brightness_k": 1.05,
+        "pro_enabled_k": True, "pro_clarity_k": 40,
+        "pro_hsl_enabled_k": True, "pro_hsl_range_k": "Rossi", "pro_hsl_hue_k": 0, "pro_hsl_sat_k": 60, "pro_hsl_light_k": 10,
+    },
+    "Cyberpunk Neon": {
+        "cc_enabled_k": True, "cc_saturation_k": 1.3, "cc_contrast_k": 1.15,
+        "pro_enabled_k": True, "pro_clarity_k": 30,
+        "pro_hsl_enabled_k": True, "pro_hsl_range_k": "Blu", "pro_hsl_hue_k": -10, "pro_hsl_sat_k": 70, "pro_hsl_light_k": 10,
+        "vignette_enabled_k": True, "vignette_amount_k": 55, "vignette_feather_k": 30,
+    },
+    "Teal & Orange Cinematic": {
+        "cc_enabled_k": True, "cc_saturation_k": 1.05, "cc_contrast_k": 1.15,
+        "pro_enabled_k": True, "pro_exposure_k": -0.1, "pro_clarity_k": 15,
+        "pro_hsl_enabled_k": True, "pro_hsl_range_k": "Ciano", "pro_hsl_hue_k": 0, "pro_hsl_sat_k": 50, "pro_hsl_light_k": 0,
+        "vignette_enabled_k": True, "vignette_amount_k": 25, "vignette_feather_k": 50,
+    },
+    "Moody Film": {
+        "cc_enabled_k": True, "cc_saturation_k": 0.85, "cc_contrast_k": 1.05,
+        "pro_enabled_k": True, "pro_shadows_k": 20, "pro_highlights_k": -25, "pro_black_k": 10, "pro_clarity_k": -10,
+    },
+    "Kodak Portra Warm": {
+        "cc_enabled_k": True, "cc_saturation_k": 1.1, "cc_brightness_k": 1.05,
+        "pro_enabled_k": True, "pro_exposure_k": 0.1, "pro_highlights_k": -15, "pro_clarity_k": 10,
+    },
+    "Pastel Matte": {
+        "cc_enabled_k": True, "cc_saturation_k": 0.8, "cc_contrast_k": 0.9,
+        "pro_enabled_k": True, "pro_black_k": 15, "pro_highlights_k": -20,
+    },
+    "Noir B&N": {
+        "cc_enabled_k": True, "cc_saturation_k": 0.0, "cc_scurve_k": 0.5,
+        "pro_enabled_k": True, "pro_clarity_k": 20,
+        "vignette_enabled_k": True, "vignette_amount_k": 60, "vignette_feather_k": 35,
+    },
+    "Clean Portrait": {
+        "cc_enabled_k": True, "cc_awb_k": True, "cc_auto_levels_k": True,
+        "denoise_enabled_k": True, "denoise_strength_k": 15,
+        "sharpen_enabled_k": True, "sharpen_amount_k": 40,
+    },
+    "Loop507 Glitch": {
+        "cc_enabled_k": True, "cc_saturation_k": 1.2, "cc_contrast_k": 1.1,
+        "pro_enabled_k": True, "pro_clarity_k": 45,
+        "pro_hsl_enabled_k": True, "pro_hsl_range_k": "Magenta", "pro_hsl_hue_k": 10, "pro_hsl_sat_k": 50, "pro_hsl_light_k": 0,
+        "vignette_enabled_k": True, "vignette_amount_k": 45, "vignette_feather_k": 25,
+    },
+}
+
 
 @dataclass
 class RetouchSettings:
@@ -168,6 +233,37 @@ def sanitize_filename(name: str) -> str:
 # Sidebar :: parametri resize
 # ---------------------------------------------------------------------------
 with st.sidebar:
+    st.subheader(":: preset")
+    preset_choice = st.selectbox(
+        "Preset di stile predefiniti",
+        options=["(nessuno)"] + list(BUILTIN_PRESETS.keys()),
+        help="Applica un punto di partenza di colore/stile pronto. Puoi sempre affinare "
+             "a mano dopo, negli slider qui sotto.",
+    )
+    if st.button("Applica preset selezionato") and preset_choice != "(nessuno)":
+        for k, v in BUILTIN_PRESETS[preset_choice].items():
+            st.session_state[k] = v
+        st.rerun()
+
+    with st.expander("Preset personalizzati (carica/salva .json)"):
+        uploaded_preset_file = st.file_uploader("Carica preset (.json)", type=["json"], key="preset_upload_k")
+        if uploaded_preset_file is not None:
+            if st.button("Applica preset caricato"):
+                try:
+                    loaded = json.loads(uploaded_preset_file.read())
+                    applied = 0
+                    for k, v in loaded.items():
+                        if k in ALL_PRESET_KEYS:
+                            st.session_state[k] = v
+                            applied += 1
+                    if applied == 0:
+                        st.error("Il file non contiene chiavi di preset riconosciute.")
+                    else:
+                        st.rerun()
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    st.error("File non valido: deve essere un JSON di preset esportato da questa app.")
+        st.caption("Per salvare il preset con le impostazioni attuali, scorri in fondo alla sidebar.")
+
     st.header(":: parametri / settings")
 
     col_w, col_h = st.columns(2)
@@ -195,7 +291,11 @@ with st.sidebar:
         pad_color = tuple(int(pad_color_hex.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
 
     st.divider()
-    output_format = st.selectbox("Formato output", options=["JPEG", "PNG"], index=0)
+    output_format = st.selectbox(
+        "Formato output", options=["JPEG", "PNG", "TIFF"], index=0,
+        help="TIFF: senza perdita, per stampa/archivio professionale (file più pesanti). "
+             "PNG: senza perdita, supporta trasparenza. JPEG: compresso, file più leggeri.",
+    )
     jpeg_quality = 95
     if output_format == "JPEG":
         jpeg_quality = st.slider("Qualità JPEG", min_value=50, max_value=100, value=95)
@@ -229,10 +329,10 @@ with st.sidebar:
         cc_auto_levels = st.checkbox("Auto livelli (stretch nero/bianco)", value=False, key="cc_auto_levels_k")
         if cc_auto_levels:
             cc_cutoff = st.slider("Cutoff auto livelli (%)", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
-        cc_brightness = st.slider("Luminosità", min_value=0.5, max_value=1.5, value=1.0, step=0.05)
-        cc_contrast = st.slider("Contrasto", min_value=0.5, max_value=1.5, value=1.0, step=0.05)
+        cc_brightness = st.slider("Luminosità", min_value=0.5, max_value=1.5, value=1.0, step=0.05, key="cc_brightness_k")
+        cc_contrast = st.slider("Contrasto", min_value=0.5, max_value=1.5, value=1.0, step=0.05, key="cc_contrast_k")
         cc_saturation = st.slider("Saturazione", min_value=0.0, max_value=2.0, value=1.0, step=0.05, key="cc_saturation_k")
-        cc_scurve = st.slider("Curva a S (contrasto tonale)", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
+        cc_scurve = st.slider("Curva a S (contrasto tonale)", min_value=0.0, max_value=1.0, value=0.0, step=0.05, key="cc_scurve_k")
 
     settings = Settings(
         target_w=int(target_w),
@@ -272,9 +372,9 @@ with st.sidebar:
         pro_highlights = st.slider("Luci", min_value=-100, max_value=100, value=0, step=5, key="pro_highlights_k")
         col_bp, col_wp = st.columns(2)
         with col_bp:
-            pro_black = st.slider("Punto neri", min_value=0, max_value=50, value=0, step=1)
+            pro_black = st.slider("Punto neri", min_value=0, max_value=50, value=0, step=1, key="pro_black_k")
         with col_wp:
-            pro_white = st.slider("Punto bianchi", min_value=205, max_value=255, value=255, step=1)
+            pro_white = st.slider("Punto bianchi", min_value=205, max_value=255, value=255, step=1, key="pro_white_k")
         pro_clarity = st.slider(
             "Chiarezza (contrasto locale)", min_value=-100, max_value=100, value=0, step=5,
             help="Positiva: aumenta il 'pop' dei dettagli. Negativa: effetto morbido/dreamy.",
@@ -282,12 +382,12 @@ with st.sidebar:
         )
 
         st.caption(":: HSL selettivo — regola una singola banda di colore")
-        pro_hsl_enabled = st.checkbox("Applica HSL selettivo", value=False)
+        pro_hsl_enabled = st.checkbox("Applica HSL selettivo", value=False, key="pro_hsl_enabled_k")
         if pro_hsl_enabled:
-            pro_hsl_range = st.selectbox("Banda colore", options=list(HSL_RANGES.keys()), index=0)
-            pro_hsl_hue = st.slider("Tonalità (°)", min_value=-30, max_value=30, value=0, step=1)
-            pro_hsl_sat = st.slider("Saturazione", min_value=-100, max_value=100, value=0, step=5)
-            pro_hsl_light = st.slider("Luminosità", min_value=-100, max_value=100, value=0, step=5)
+            pro_hsl_range = st.selectbox("Banda colore", options=list(HSL_RANGES.keys()), index=0, key="pro_hsl_range_k")
+            pro_hsl_hue = st.slider("Tonalità (°)", min_value=-30, max_value=30, value=0, step=1, key="pro_hsl_hue_k")
+            pro_hsl_sat = st.slider("Saturazione", min_value=-100, max_value=100, value=0, step=5, key="pro_hsl_sat_k")
+            pro_hsl_light = st.slider("Luminosità", min_value=-100, max_value=100, value=0, step=5, key="pro_hsl_light_k")
 
     pro_settings = ProSettings(
         enabled=pro_enabled,
@@ -337,14 +437,15 @@ with st.sidebar:
             )
 
     with st.expander("Vignettatura"):
-        vignette_enabled = st.checkbox("Applica vignettatura", value=False)
+        vignette_enabled = st.checkbox("Applica vignettatura", value=False, key="vignette_enabled_k")
         vignette_amount = 0
         vignette_feather = 50
         if vignette_enabled:
-            vignette_amount = st.slider("Intensità vignetta", min_value=0, max_value=100, value=40, step=5)
+            vignette_amount = st.slider("Intensità vignetta", min_value=0, max_value=100, value=40, step=5, key="vignette_amount_k")
             vignette_feather = st.slider(
                 "Morbidezza bordo", min_value=0, max_value=100, value=50, step=5,
                 help="Bassa = vignetta che parte più vicino al centro (più marcata). Alta = falloff più graduale.",
+                key="vignette_feather_k",
             )
 
     retouch_settings = RetouchSettings(
@@ -425,6 +526,30 @@ with st.sidebar:
         help="Con batch grandi mostrare tutte le anteprime rallenta l'app. "
              "Il download (singolo o ZIP) include comunque tutte le immagini.",
     )
+
+    st.divider()
+    with st.expander("💾 Salva impostazioni attuali come preset"):
+        current_preset = {
+            "cc_enabled_k": cc_enabled, "cc_awb_k": cc_awb, "cc_auto_levels_k": cc_auto_levels,
+            "cc_brightness_k": cc_brightness, "cc_contrast_k": cc_contrast,
+            "cc_saturation_k": cc_saturation, "cc_scurve_k": cc_scurve,
+            "pro_enabled_k": pro_enabled, "pro_exposure_k": pro_exposure,
+            "pro_shadows_k": pro_shadows, "pro_highlights_k": pro_highlights,
+            "pro_black_k": pro_black, "pro_white_k": pro_white, "pro_clarity_k": pro_clarity,
+            "pro_hsl_enabled_k": pro_hsl_enabled, "pro_hsl_range_k": pro_hsl_range,
+            "pro_hsl_hue_k": pro_hsl_hue, "pro_hsl_sat_k": pro_hsl_sat, "pro_hsl_light_k": pro_hsl_light,
+            "denoise_enabled_k": denoise_enabled, "denoise_strength_k": denoise_strength,
+            "sharpen_enabled_k": sharpen_enabled, "sharpen_amount_k": sharpen_amount,
+            "vignette_enabled_k": vignette_enabled, "vignette_amount_k": vignette_amount,
+            "vignette_feather_k": vignette_feather,
+        }
+        st.download_button(
+            "⬇ scarica preset (.json)",
+            data=json.dumps(current_preset, indent=2),
+            file_name="mio_preset_loop507.json",
+            mime="application/json",
+        )
+        st.caption("Ricaricalo in qualsiasi sessione futura con 'Preset personalizzati' in cima alla sidebar.")
 
 # ---------------------------------------------------------------------------
 # Upload
@@ -1055,7 +1180,7 @@ def process_image(img: Image.Image, s: Settings, cs: ColorSettings, ps: ProSetti
     resize applicati identicamente alla maschera; le aree di padding
     diventano opache). Regolazioni colore/pro/nitidezza/vignetta lavorano
     solo sull'RGB: la trasparenza non va né corretta né 'denoisata'."""
-    preserve_alpha = s.output_format == "PNG" and has_transparency(img)
+    preserve_alpha = s.output_format in ("PNG", "TIFF") and has_transparency(img)
     alpha = img.convert("RGBA").split()[-1] if preserve_alpha else None
 
     rgb = flatten_to_rgb(img)
@@ -1075,6 +1200,8 @@ def image_to_bytes(img: Image.Image, fmt: str, quality: int) -> bytes:
     buf = io.BytesIO()
     if fmt == "JPEG":
         img.save(buf, format="JPEG", quality=quality)
+    elif fmt == "TIFF":
+        img.save(buf, format="TIFF")  # senza perdita, nessuna compressione lossy
     else:
         img.save(buf, format="PNG")
     return buf.getvalue()
@@ -1239,7 +1366,8 @@ if uploaded_files:
     if st.button("▶ Elabora tutte", type="primary"):
         st.session_state.processed = []
         progress = st.progress(0.0)
-        ext = "jpg" if settings.output_format == "JPEG" else "png"
+        ext_map = {"JPEG": "jpg", "PNG": "png", "TIFF": "tiff"}
+        ext = ext_map[settings.output_format]
         used_names = set()
 
         for i, uf in enumerate(uploaded_files):
@@ -1262,7 +1390,7 @@ if uploaded_files:
 
         # JPEG è già compresso: ZIP_STORED evita di sprecare CPU ricomprimendo
         # dati incomprimibili. Per PNG, ZIP_DEFLATED può ancora aiutare un po'.
-        zip_compression = zipfile.ZIP_STORED if settings.output_format == "JPEG" else zipfile.ZIP_DEFLATED
+        zip_compression = zipfile.ZIP_DEFLATED if settings.output_format == "PNG" else zipfile.ZIP_STORED
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zip_compression) as zf:
             for name, data, _, _, _, _ in st.session_state.processed:
@@ -1287,7 +1415,7 @@ if uploaded_files:
                     "⬇ scarica singola",
                     data=data,
                     file_name=name,
-                    mime=f"image/{'jpeg' if settings.output_format == 'JPEG' else 'png'}",
+                    mime={"JPEG": "image/jpeg", "PNG": "image/png", "TIFF": "image/tiff"}[settings.output_format],
                     key=f"dl_{i}_{name}",
                 )
             st.divider()
