@@ -201,6 +201,51 @@ BUILTIN_PRESETS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Callback per i pulsanti che scrivono su session_state per chiavi di widget
+# già istanziati. IMPORTANTE: Streamlit vieta di scrivere in session_state[key]
+# per un widget con quella key DOPO che è già stato creato nella stessa run
+# (StreamlitAPIException). La soluzione corretta è on_click: il callback gira
+# PRIMA che lo script (e quindi i widget) vengano ri-eseguiti, quindi non c'è
+# alcun conflitto — mai fare l'assegnazione diretta seguita da un st.rerun()
+# manuale per questi casi.
+# ---------------------------------------------------------------------------
+def _reset_all_preset_keys():
+    for k in ALL_PRESET_KEYS:
+        st.session_state.pop(k, None)
+    st.session_state.pop("auto_optimize_report", None)
+
+
+def apply_builtin_preset_cb(preset_name: str):
+    if preset_name == "(nessuno)":
+        return
+    _reset_all_preset_keys()
+    for k, v in BUILTIN_PRESETS[preset_name].items():
+        st.session_state[k] = v
+
+
+def apply_loaded_preset_cb(uploaded_file):
+    if uploaded_file is None:
+        return
+    try:
+        uploaded_file.seek(0)
+        loaded = json.loads(uploaded_file.read())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        st.session_state["_preset_load_error"] = "File non valido: deve essere un JSON di preset esportato da questa app."
+        return
+    applied = 0
+    _reset_all_preset_keys()
+    for k, v in loaded.items():
+        if k in ALL_PRESET_KEYS:
+            st.session_state[k] = v
+            applied += 1
+    st.session_state["_preset_load_error"] = None if applied > 0 else "Il file non contiene chiavi di preset riconosciute."
+
+
+def reset_manual_settings_cb():
+    _reset_all_preset_keys()
+
+
 @dataclass
 class RetouchSettings:
     straighten_angle: float    # -45..45 gradi
@@ -250,32 +295,14 @@ with st.sidebar:
         help="Applica un punto di partenza di colore/stile pronto. Puoi sempre affinare "
              "a mano dopo, negli slider qui sotto.",
     )
-    if st.button("Applica preset selezionato") and preset_choice != "(nessuno)":
-        for k in ALL_PRESET_KEYS:  # azzera prima, per un risultato deterministico
-            st.session_state.pop(k, None)
-        for k, v in BUILTIN_PRESETS[preset_choice].items():
-            st.session_state[k] = v
-        st.rerun()
+    st.button("Applica preset selezionato", on_click=apply_builtin_preset_cb, args=(preset_choice,))
 
     with st.expander("Preset personalizzati (carica/salva .json)"):
         uploaded_preset_file = st.file_uploader("Carica preset (.json)", type=["json"], key="preset_upload_k")
         if uploaded_preset_file is not None:
-            if st.button("Applica preset caricato"):
-                try:
-                    loaded = json.loads(uploaded_preset_file.read())
-                    applied = 0
-                    for k in ALL_PRESET_KEYS:  # azzera prima, per un risultato deterministico
-                        st.session_state.pop(k, None)
-                    for k, v in loaded.items():
-                        if k in ALL_PRESET_KEYS:
-                            st.session_state[k] = v
-                            applied += 1
-                    if applied == 0:
-                        st.error("Il file non contiene chiavi di preset riconosciute.")
-                    else:
-                        st.rerun()
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    st.error("File non valido: deve essere un JSON di preset esportato da questa app.")
+            st.button("Applica preset caricato", on_click=apply_loaded_preset_cb, args=(uploaded_preset_file,))
+            if st.session_state.get("_preset_load_error"):
+                st.error(st.session_state["_preset_load_error"])
         st.caption("Per salvare il preset con le impostazioni attuali, scorri in fondo alla sidebar.")
 
     st.header(":: parametri / settings")
@@ -1336,6 +1363,29 @@ def build_output_name(original_name: str, rename_base: str, custom_name: str, in
 # ---------------------------------------------------------------------------
 # Ottimizzazione automatica
 # ---------------------------------------------------------------------------
+def auto_optimize_cb(ref_file):
+    ref_for_analysis = Image.open(ref_file)
+    analysis = analyze_photo(ref_for_analysis)
+
+    st.session_state["cc_enabled_k"] = True
+    st.session_state["cc_awb_k"] = analysis["awb"]
+    st.session_state["cc_auto_levels_k"] = analysis["auto_levels"]
+    st.session_state["cc_saturation_k"] = analysis["saturation"]
+
+    st.session_state["pro_enabled_k"] = True
+    st.session_state["pro_exposure_k"] = analysis["exposure"]
+    st.session_state["pro_shadows_k"] = analysis["shadows"]
+    st.session_state["pro_highlights_k"] = analysis["highlights"]
+    st.session_state["pro_clarity_k"] = analysis["clarity"]
+
+    st.session_state["denoise_enabled_k"] = analysis["denoise_strength"] > 0
+    st.session_state["denoise_strength_k"] = analysis["denoise_strength"]
+    st.session_state["sharpen_enabled_k"] = analysis["sharpen_amount"] > 0
+    st.session_state["sharpen_amount_k"] = analysis["sharpen_amount"]
+
+    st.session_state["auto_optimize_report"] = analysis
+
+
 if uploaded_files:
     st.divider()
     st.subheader(":: ottimizzazione automatica")
@@ -1346,38 +1396,12 @@ if uploaded_files:
     )
     col_auto1, col_auto2 = st.columns([1, 1])
     with col_auto1:
-        auto_clicked = st.button("✨ Analizza e ottimizza automaticamente", type="primary")
+        st.button(
+            "✨ Analizza e ottimizza automaticamente", type="primary",
+            on_click=auto_optimize_cb, args=(uploaded_files[0],),
+        )
     with col_auto2:
-        reset_clicked = st.button("↺ Ripristina impostazioni manuali")
-
-    if auto_clicked:
-        ref_for_analysis = Image.open(uploaded_files[0])
-        analysis = analyze_photo(ref_for_analysis)
-
-        st.session_state["cc_enabled_k"] = True
-        st.session_state["cc_awb_k"] = analysis["awb"]
-        st.session_state["cc_auto_levels_k"] = analysis["auto_levels"]
-        st.session_state["cc_saturation_k"] = analysis["saturation"]
-
-        st.session_state["pro_enabled_k"] = True
-        st.session_state["pro_exposure_k"] = analysis["exposure"]
-        st.session_state["pro_shadows_k"] = analysis["shadows"]
-        st.session_state["pro_highlights_k"] = analysis["highlights"]
-        st.session_state["pro_clarity_k"] = analysis["clarity"]
-
-        st.session_state["denoise_enabled_k"] = analysis["denoise_strength"] > 0
-        st.session_state["denoise_strength_k"] = analysis["denoise_strength"]
-        st.session_state["sharpen_enabled_k"] = analysis["sharpen_amount"] > 0
-        st.session_state["sharpen_amount_k"] = analysis["sharpen_amount"]
-
-        st.session_state["auto_optimize_report"] = analysis
-        st.rerun()
-
-    if reset_clicked:
-        for k in ALL_PRESET_KEYS:
-            st.session_state.pop(k, None)
-        st.session_state.pop("auto_optimize_report", None)
-        st.rerun()
+        st.button("↺ Ripristina impostazioni manuali", on_click=reset_manual_settings_cb)
 
     if "auto_optimize_report" in st.session_state:
         a = st.session_state.auto_optimize_report
