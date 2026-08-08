@@ -1486,8 +1486,9 @@ if uploaded_files:
             progress.progress((i + 1) / len(uploaded_files))
 
         # JPEG è già compresso: ZIP_STORED evita di sprecare CPU ricomprimendo
-        # dati incomprimibili. Per PNG, ZIP_DEFLATED può ancora aiutare un po'.
-        zip_compression = zipfile.ZIP_DEFLATED if settings.output_format == "PNG" else zipfile.ZIP_STORED
+        # dati incomprimibili. PNG e TIFF (quest'ultimo salvato senza alcuna
+        # compressione, vedi image_to_bytes) beneficiano invece di ZIP_DEFLATED.
+        zip_compression = zipfile.ZIP_STORED if settings.output_format == "JPEG" else zipfile.ZIP_DEFLATED
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zip_compression) as zf:
             for name, data, _, _, _, _ in st.session_state.processed:
