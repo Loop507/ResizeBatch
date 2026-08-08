@@ -1349,15 +1349,15 @@ def build_output_name(original_name: str, rename_base: str, custom_name: str, in
     """
     if custom_name and custom_name.strip():
         base = sanitize_filename(custom_name.strip())
-        return f"{base}_{tw}x{th}.{ext}"
+        return f"{base}.{ext}"
     if not rename_base:
         base = sanitize_filename(original_name.rsplit(".", 1)[0])
-        return f"{base}_{tw}x{th}.{ext}"
+        return f"{base}.{ext}"
     if "{n}" in rename_base:
         base = rename_base.replace("{n}", str(index))
     else:
         base = f"{rename_base}_{index}"
-    return f"{sanitize_filename(base)}_{tw}x{th}.{ext}"
+    return f"{sanitize_filename(base)}.{ext}"
 
 
 # ---------------------------------------------------------------------------
