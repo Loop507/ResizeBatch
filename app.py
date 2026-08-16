@@ -35,6 +35,15 @@ import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 
+# streamlit-cropper è una dipendenza OPZIONALE per il ritaglio libero "a
+# occhio": se non è installata (va aggiunta a requirements.txt) la relativa
+# sezione si disattiva da sola con un avviso, senza far crashare l'app.
+try:
+    from streamlit_cropper import st_cropper
+    CROPPER_AVAILABLE = True
+except ImportError:
+    CROPPER_AVAILABLE = False
+
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 FONT_PATHS = {
     "Regular": os.path.join(FONT_DIR, "IBMPlexMono-Regular.ttf"),
@@ -261,6 +270,7 @@ class RetouchSettings:
     vignette_enabled: bool
     vignette_amount: int       # 0..100
     vignette_feather: int      # 0..100
+    free_crop_box: tuple = None  # (left%, top%, width%, height%) o None se disattivato
 
 
 @dataclass
@@ -684,6 +694,77 @@ if uploaded_files:
 
 
 # ---------------------------------------------------------------------------
+# Ritaglio libero (box) — posizionato "a occhio" sulla prima foto caricata
+# e poi applicato in proporzione a tutte le foto del batch, indipendentemente
+# dalla risoluzione di partenza di ciascuna.
+# ---------------------------------------------------------------------------
+free_crop_pct = None
+if uploaded_files:
+    st.divider()
+    st.subheader(":: ritaglio libero (box)")
+    if not CROPPER_AVAILABLE:
+        st.warning(
+            "Per il ritaglio libero manca la libreria 'streamlit-cropper'. "
+            "Aggiungi 'streamlit-cropper' al requirements.txt del repo GitHub "
+            "e fai il redeploy (Manage → Reboot app) per attivare questa sezione."
+        )
+    else:
+        free_crop_enabled = st.checkbox(
+            "Attiva ritaglio libero e applicalo a tutte le foto",
+            value=False,
+            key="free_crop_enabled_k",
+            help="Posiziona il box sulla prima foto caricata: la stessa area, in "
+                 "proporzione, viene poi ritagliata su ogni foto del batch — anche "
+                 "se le foto partono da risoluzioni diverse tra loro.",
+        )
+        if free_crop_enabled:
+            aspect_labels = {
+                "Libero": None,
+                "1:1 (quadrato)": (1, 1),
+                "4:5 (verticale social)": (4, 5),
+                "5:4": (5, 4),
+                "16:9 (orizzontale)": (16, 9),
+                "9:16 (verticale / stories)": (9, 16),
+                "Rapporto target sidebar": (settings.target_w, settings.target_h),
+            }
+            aspect_choice = st.selectbox(
+                "Rapporto del box", options=list(aspect_labels.keys()), index=0,
+            )
+            aspect_ratio = aspect_labels[aspect_choice]
+
+            ref_file_crop = uploaded_files[0]
+            ref_img_crop = Image.open(ref_file_crop).convert("RGB")
+            st.caption(
+                f"Posiziona il box trascinandolo sulla foto di riferimento — "
+                f"{ref_file_crop.name} ({ref_img_crop.size[0]}x{ref_img_crop.size[1]})"
+            )
+
+            box = st_cropper(
+                ref_img_crop,
+                realtime_update=True,
+                box_color="#FF4B4B",
+                aspect_ratio=aspect_ratio,
+                return_type="box",
+                key="free_crop_box_widget",
+            )
+
+            ref_w, ref_h = ref_img_crop.size
+            left_pct = box["left"] / ref_w * 100.0
+            top_pct = box["top"] / ref_h * 100.0
+            w_pct = box["width"] / ref_w * 100.0
+            h_pct = box["height"] / ref_h * 100.0
+            free_crop_pct = (left_pct, top_pct, w_pct, h_pct)
+
+            st.caption(
+                f":: box: {box['width']}x{box['height']}px sulla foto di riferimento "
+                f"({w_pct:.1f}% × {h_pct:.1f}% dell'immagine) — applicato in proporzione "
+                "a ogni foto del batch."
+            )
+
+retouch_settings = replace(retouch_settings, free_crop_box=free_crop_pct)
+
+
+# ---------------------------------------------------------------------------
 # Funzioni di correzione colore
 # ---------------------------------------------------------------------------
 def auto_white_balance(img: Image.Image) -> Image.Image:
@@ -1019,6 +1100,26 @@ def apply_manual_crop(img: Image.Image, top: int, bottom: int, left: int, right:
     return img.crop((x0, y0, x1, y1))
 
 
+def apply_free_crop_box(img: Image.Image, box_pct: tuple) -> Image.Image:
+    """Ritaglio libero "a occhio": il box (left%, top%, width%, height%)
+    viene posizionato UNA VOLTA sulla foto di riferimento nell'interfaccia,
+    poi applicato in proporzione a ogni foto del batch — così funziona
+    anche se le foto hanno risoluzioni di partenza diverse tra loro."""
+    if not box_pct:
+        return img
+    left_pct, top_pct, w_pct, h_pct = box_pct
+    src_w, src_h = img.size
+    x0 = int(round(src_w * left_pct / 100.0))
+    y0 = int(round(src_h * top_pct / 100.0))
+    cw = int(round(src_w * w_pct / 100.0))
+    ch = int(round(src_h * h_pct / 100.0))
+    x0 = min(max(x0, 0), src_w - 1)
+    y0 = min(max(y0, 0), src_h - 1)
+    cw = max(1, min(cw, src_w - x0))
+    ch = max(1, min(ch, src_h - y0))
+    return img.crop((x0, y0, x0 + cw, y0 + ch))
+
+
 def apply_denoise(img: Image.Image, strength: int) -> Image.Image:
     """Riduzione del rumore con bilateral filter (OpenCV): leviga il
     rumore preservando i bordi netti molto meglio di un blur uniforme."""
@@ -1063,10 +1164,12 @@ def apply_vignette(img: Image.Image, amount: int, feather: int) -> Image.Image:
 
 
 def apply_retouch(img: Image.Image, rs: RetouchSettings) -> Image.Image:
-    """Ordine: raddrizza -> crop manuale -> denoise (prima del resize, a
-    piena risoluzione, dove funziona meglio). Nitidezza e vignettatura
-    vengono applicate altrove nella pipeline (dopo il resize)."""
+    """Ordine: raddrizza -> ritaglio libero (box) -> crop manuale bordi ->
+    denoise (prima del resize, a piena risoluzione, dove funziona meglio).
+    Nitidezza e vignettatura vengono applicate altrove nella pipeline
+    (dopo il resize)."""
     out = apply_straighten(img, rs.straighten_angle)
+    out = apply_free_crop_box(out, rs.free_crop_box)
     out = apply_manual_crop(out, rs.crop_top, rs.crop_bottom, rs.crop_left, rs.crop_right)
     if rs.denoise_enabled:
         out = apply_denoise(out, rs.denoise_strength)
@@ -1075,9 +1178,11 @@ def apply_retouch(img: Image.Image, rs: RetouchSettings) -> Image.Image:
 
 def apply_retouch_pair(img: Image.Image, alpha, rs: RetouchSettings) -> tuple:
     """Come apply_retouch, ma applica anche a una maschera alpha (se
-    presente) le stesse trasformazioni geometriche (raddrizza, crop) — il
-    denoise invece resta solo sull'RGB, la trasparenza non va 'denoisata'."""
+    presente) le stesse trasformazioni geometriche (raddrizza, ritaglio
+    libero, crop bordi) — il denoise invece resta solo sull'RGB, la
+    trasparenza non va 'denoisata'."""
     out = apply_straighten(img, rs.straighten_angle)
+    out = apply_free_crop_box(out, rs.free_crop_box)
     out = apply_manual_crop(out, rs.crop_top, rs.crop_bottom, rs.crop_left, rs.crop_right)
     if rs.denoise_enabled:
         out = apply_denoise(out, rs.denoise_strength)
@@ -1085,6 +1190,7 @@ def apply_retouch_pair(img: Image.Image, alpha, rs: RetouchSettings) -> tuple:
     if alpha is None:
         return out, None
     out_alpha = apply_straighten(alpha, rs.straighten_angle)
+    out_alpha = apply_free_crop_box(out_alpha, rs.free_crop_box)
     out_alpha = apply_manual_crop(out_alpha, rs.crop_top, rs.crop_bottom, rs.crop_left, rs.crop_right)
     return out, out_alpha
 
