@@ -27,7 +27,7 @@ import math
 import os
 import re
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
@@ -83,6 +83,7 @@ class Settings:
     output_format: str
     jpeg_quality: int
     rename_base: str
+    transform: str = "none"  # none | rot90cw | rot90ccw | rot180 | flip_h | flip_v
 
 
 @dataclass
@@ -332,6 +333,29 @@ with st.sidebar:
         pad_color = tuple(int(pad_color_hex.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
 
     st.divider()
+    st.subheader(":: trasformazione geometrica")
+    transform_labels = {
+        "none": "Nessuna",
+        "rot90cw": "Ruota 90° orario",
+        "rot90ccw": "Ruota 90° antiorario",
+        "rot180": "Ruota 180°",
+        "flip_h": "Rifletti orizzontale (specchio sx/dx)",
+        "flip_v": "Rifletti verticale (specchio alto/basso)",
+    }
+    transform = st.selectbox(
+        "Ruota / rifletti tutte le foto",
+        options=list(transform_labels.keys()),
+        format_func=lambda k: transform_labels[k],
+        index=0,
+        help="Applicata PRIMA del resize. Con le rotazioni a 90° larghezza e "
+             "altezza target vengono scambiate automaticamente, così una foto "
+             "1280x720 ruotata diventa 720x1280 invece di essere forzata nel "
+             "rapporto originale.",
+    )
+    if transform in ("rot90cw", "rot90ccw"):
+        st.caption(f":: con questa rotazione l'output sarà {int(target_h)}x{int(target_w)} invece di {int(target_w)}x{int(target_h)}")
+
+    st.divider()
     output_format = st.selectbox(
         "Formato output", options=["JPEG", "PNG", "TIFF"], index=0,
         help="TIFF: senza perdita, per stampa/archivio professionale (file più pesanti). "
@@ -383,6 +407,7 @@ with st.sidebar:
         output_format=output_format,
         jpeg_quality=jpeg_quality,
         rename_base=rename_base.strip(),
+        transform=transform,
     )
 
     color_settings = ColorSettings(
@@ -582,7 +607,10 @@ with st.sidebar:
     )
 
     st.divider()
-    st.caption(f":: target ratio = {settings.target_w / settings.target_h:.3f}")
+    if settings.transform in ("rot90cw", "rot90ccw"):
+        st.caption(f":: target ratio (dopo rotazione) = {settings.target_h / settings.target_w:.3f}")
+    else:
+        st.caption(f":: target ratio = {settings.target_w / settings.target_h:.3f}")
 
     st.divider()
     st.subheader(":: anteprima")
@@ -1074,6 +1102,30 @@ def apply_retouch_post_resize(img: Image.Image, rs: RetouchSettings) -> Image.Im
 
 
 # ---------------------------------------------------------------------------
+# Trasformazione geometrica (rotazione / riflessione) — applicata PRIMA del
+# resize, sia all'RGB sia (a monte, sull'immagine intera con alpha) alla
+# trasparenza, così restano allineati senza logica separata.
+# ---------------------------------------------------------------------------
+def apply_geometric_transform(img: Image.Image, transform: str) -> Image.Image:
+    """Ruota/riflette l'immagine. Le rotazioni a 90° scambiano larghezza e
+    altezza: la geometria del canvas target va scambiata di conseguenza a
+    valle (vedi process_image), altrimenti il resize successivo forzerebbe
+    l'immagine ruotata dentro il rapporto w/h originale, deformandola o
+    ritagliandola in modo indesiderato."""
+    if transform == "rot90cw":
+        return img.transpose(Image.ROTATE_270)  # 270° antiorario = 90° orario
+    elif transform == "rot90ccw":
+        return img.transpose(Image.ROTATE_90)
+    elif transform == "rot180":
+        return img.transpose(Image.ROTATE_180)
+    elif transform == "flip_h":
+        return img.transpose(Image.FLIP_LEFT_RIGHT)
+    elif transform == "flip_v":
+        return img.transpose(Image.FLIP_TOP_BOTTOM)
+    return img
+
+
+# ---------------------------------------------------------------------------
 # Funzioni di trasformazione (resize)
 # ---------------------------------------------------------------------------
 def resize_stretch(img: Image.Image, tw: int, th: int) -> Image.Image:
@@ -1284,6 +1336,16 @@ def process_image(img: Image.Image, s: Settings, cs: ColorSettings, ps: ProSetti
     resize applicati identicamente alla maschera; le aree di padding
     diventano opache). Regolazioni colore/pro/nitidezza/vignetta lavorano
     solo sull'RGB: la trasparenza non va né corretta né 'denoisata'."""
+    # La rotazione/riflessione va applicata per prima, sull'immagine intera
+    # (RGB + eventuale alpha insieme via transpose), così la trasparenza
+    # resta allineata senza bisogno di una pipeline separata.
+    img = apply_geometric_transform(img, s.transform)
+    if s.transform in ("rot90cw", "rot90ccw"):
+        # con una rotazione a 90° l'immagine scambia larghezza/altezza:
+        # il canvas target segue lo scambio, altrimenti il resize successivo
+        # rimetterebbe l'immagine ruotata nel rapporto w/h originale.
+        s = replace(s, target_w=s.target_h, target_h=s.target_w)
+
     preserve_alpha = s.output_format in ("PNG", "TIFF") and has_transparency(img)
     alpha = img.convert("RGBA").split()[-1] if preserve_alpha else None
 
@@ -1486,9 +1548,8 @@ if uploaded_files:
             progress.progress((i + 1) / len(uploaded_files))
 
         # JPEG è già compresso: ZIP_STORED evita di sprecare CPU ricomprimendo
-        # dati incomprimibili. PNG e TIFF (quest'ultimo salvato senza alcuna
-        # compressione, vedi image_to_bytes) beneficiano invece di ZIP_DEFLATED.
-        zip_compression = zipfile.ZIP_STORED if settings.output_format == "JPEG" else zipfile.ZIP_DEFLATED
+        # dati incomprimibili. Per PNG, ZIP_DEFLATED può ancora aiutare un po'.
+        zip_compression = zipfile.ZIP_DEFLATED if settings.output_format == "PNG" else zipfile.ZIP_STORED
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zip_compression) as zf:
             for name, data, _, _, _, _ in st.session_state.processed:
