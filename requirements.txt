@@ -3,3 +3,4 @@ pillow
 numpy
 opencv-python-headless
 pandas
+streamlit-cropper
