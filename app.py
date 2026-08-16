@@ -296,6 +296,32 @@ def sanitize_filename(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Trasformazione geometrica (rotazione / riflessione) — applicata PRIMA del
+# resize, sia all'RGB sia (a monte, sull'immagine intera con alpha) alla
+# trasparenza, così restano allineati senza logica separata. Definita qui
+# (prima della sidebar) perché serve anche alla sezione "ritaglio libero"
+# più avanti nel main body, per mostrare il box sull'orientamento corretto.
+# ---------------------------------------------------------------------------
+def apply_geometric_transform(img: Image.Image, transform: str) -> Image.Image:
+    """Ruota/riflette l'immagine. Le rotazioni a 90° scambiano larghezza e
+    altezza: la geometria del canvas target va scambiata di conseguenza a
+    valle (vedi process_image), altrimenti il resize successivo forzerebbe
+    l'immagine ruotata dentro il rapporto w/h originale, deformandola o
+    ritagliandola in modo indesiderato."""
+    if transform == "rot90cw":
+        return img.transpose(Image.ROTATE_270)  # 270° antiorario = 90° orario
+    elif transform == "rot90ccw":
+        return img.transpose(Image.ROTATE_90)
+    elif transform == "rot180":
+        return img.transpose(Image.ROTATE_180)
+    elif transform == "flip_h":
+        return img.transpose(Image.FLIP_LEFT_RIGHT)
+    elif transform == "flip_v":
+        return img.transpose(Image.FLIP_TOP_BOTTOM)
+    return img
+
+
+# ---------------------------------------------------------------------------
 # Sidebar :: parametri resize
 # ---------------------------------------------------------------------------
 with st.sidebar:
@@ -718,6 +744,15 @@ if uploaded_files:
                  "se le foto partono da risoluzioni diverse tra loro.",
         )
         if free_crop_enabled:
+            # Rapporto "target sidebar": se è attiva una rotazione a 90°,
+            # il canvas finale ha w/h scambiati (vedi apply_geometric_transform
+            # / process_image) — quindi il rapporto del box deve seguirlo,
+            # altrimenti il box non combacerebbe con l'immagine ruotata.
+            if settings.transform in ("rot90cw", "rot90ccw"):
+                target_ratio_tuple = (settings.target_h, settings.target_w)
+            else:
+                target_ratio_tuple = (settings.target_w, settings.target_h)
+
             aspect_labels = {
                 "Libero": None,
                 "1:1 (quadrato)": (1, 1),
@@ -725,18 +760,30 @@ if uploaded_files:
                 "5:4": (5, 4),
                 "16:9 (orizzontale)": (16, 9),
                 "9:16 (verticale / stories)": (9, 16),
-                "Rapporto target sidebar": (settings.target_w, settings.target_h),
+                "Rapporto target sidebar": target_ratio_tuple,
             }
             aspect_choice = st.selectbox(
                 "Rapporto del box", options=list(aspect_labels.keys()), index=0,
             )
             aspect_ratio = aspect_labels[aspect_choice]
 
+            # BUG FIX: nella pipeline (process_image) l'eventuale rotazione/
+            # riflessione viene applicata PRIMA del ritaglio libero. Se qui
+            # mostrassimo la foto nel suo orientamento originale, il box
+            # disegnato dall'utente NON corrisponderebbe più alla stessa area
+            # una volta ruotata l'immagine nella pipeline reale — quindi
+            # applichiamo la stessa trasformazione anche alla foto di
+            # riferimento, prima di mostrarla nel cropper.
             ref_file_crop = uploaded_files[0]
             ref_img_crop = Image.open(ref_file_crop).convert("RGB")
+            ref_img_crop = apply_geometric_transform(ref_img_crop, settings.transform)
+
+            caption_suffix = ""
+            if settings.transform != "none":
+                caption_suffix = f" — già ruotata/riflessa ({transform_labels[settings.transform]}) come nell'output finale"
             st.caption(
                 f"Posiziona il box trascinandolo sulla foto di riferimento — "
-                f"{ref_file_crop.name} ({ref_img_crop.size[0]}x{ref_img_crop.size[1]})"
+                f"{ref_file_crop.name} ({ref_img_crop.size[0]}x{ref_img_crop.size[1]}){caption_suffix}"
             )
 
             box = st_cropper(
@@ -1205,30 +1252,6 @@ def apply_retouch_post_resize(img: Image.Image, rs: RetouchSettings) -> Image.Im
     if rs.vignette_enabled:
         out = apply_vignette(out, rs.vignette_amount, rs.vignette_feather)
     return out
-
-
-# ---------------------------------------------------------------------------
-# Trasformazione geometrica (rotazione / riflessione) — applicata PRIMA del
-# resize, sia all'RGB sia (a monte, sull'immagine intera con alpha) alla
-# trasparenza, così restano allineati senza logica separata.
-# ---------------------------------------------------------------------------
-def apply_geometric_transform(img: Image.Image, transform: str) -> Image.Image:
-    """Ruota/riflette l'immagine. Le rotazioni a 90° scambiano larghezza e
-    altezza: la geometria del canvas target va scambiata di conseguenza a
-    valle (vedi process_image), altrimenti il resize successivo forzerebbe
-    l'immagine ruotata dentro il rapporto w/h originale, deformandola o
-    ritagliandola in modo indesiderato."""
-    if transform == "rot90cw":
-        return img.transpose(Image.ROTATE_270)  # 270° antiorario = 90° orario
-    elif transform == "rot90ccw":
-        return img.transpose(Image.ROTATE_90)
-    elif transform == "rot180":
-        return img.transpose(Image.ROTATE_180)
-    elif transform == "flip_h":
-        return img.transpose(Image.FLIP_LEFT_RIGHT)
-    elif transform == "flip_v":
-        return img.transpose(Image.FLIP_TOP_BOTTOM)
-    return img
 
 
 # ---------------------------------------------------------------------------
